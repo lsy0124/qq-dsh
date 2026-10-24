@@ -1,0 +1,19 @@
+{
+  "input": {
+    "name": "qq-bridge-for-codex.zip",
+    "sha256": "26f2c51bba9c243c14cba5aba72a3cf1b2fbc9bd0dd38e9dde89b3a9de205027",
+    "declaredVersion": "0.2.0-r4"
+  },
+  "upstream": {
+    "repository": "https://github.com/Derpyu520/qq-bridge",
+    "license": "MIT"
+  },
+  "restoredConsole": {
+    "tag": "v0.2.0-r4",
+    "blob": "64bf3daabe539d2b0f1a93c4ef20a7385b28c7b1",
+    "sha256": "6f7c7e15ecea2e4ffec06770e655e549fb1a2960441ea4f89ff22ebbff686a22",
+    "bytes": 240741
+  },
+  "integrationVersion": "0.3.0",
+  "liveValidation": false
+}

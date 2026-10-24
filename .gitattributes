@@ -1,0 +1,2 @@
+# Preserve byte-level console provenance and ASCII/CRLF Windows launchers.
+* -text
