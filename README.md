@@ -20,6 +20,37 @@ QQ 消息经 SnowLuma / OneBot v11 到本桥接，再调用 DSH；是否发送�
 
 需要 **Node.js ≥22.13**、npm、已工作的 DSH Desktop 和 SnowLuma / OneBot v11 网关。仅处理代码和测试时不需要运行 QQ 或 DSH。
 
+### 方式一：一键安装（推荐）
+
+```powershell
+git clone https://github.com/lsy0124/qq-dsh.git
+cd qq-dsh
+node scripts/install.mjs
+```
+
+Windows 用户也可以双击 **`安装.bat`**。
+
+它会自动做：
+
+```
+1. 检查 Node 版本
+2. 装依赖（npm ci / install）+ playwright-core
+3. 创建 config.json（从模板，不覆盖已有）
+4. 编译 agent preset
+5. 挂载到 DSH profile
+6. 跑完整体检，把缺的东西全列出来
+```
+
+装完会告诉你**还差什么、怎么补、影响哪个功能**。之后随时可以复查：
+
+```powershell
+node scripts/doctor-full.mjs       # 只看不缺什么
+```
+
+体检会自动发现 RVC / GPT-SoVITS / FFmpeg / Python 的路径（不要求它们在 PATH 里）。
+
+### 方式二：手动安装
+
 ```powershell
 git clone https://github.com/lsy0124/qq-dsh.git
 cd qq-dsh
