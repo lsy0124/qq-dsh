@@ -68,8 +68,111 @@ npm run privacy-scan
 
 本次在 Windows / Node 24 上进行离线验证；**没有执行真实 QQ 收发、GPU 推理或模型端到端验收**。其他平台、Node 版本和 DSH 新协议仍需验证。验证结果见 [docs/VALIDATION.md](docs/VALIDATION.md)。
 
+## 能力清单
+
+桥接本身只负责消息路由。**下面这些能力全部通过 MCP server 挂给 DSH**，AI 按需调用。
+
+### QQ（`mcp-snowluma-safe.js`，45 个工具）
+
+| 类别 | 代表工具 |
+|---|---|
+| 消息 | `qq_send_message` / `qq_send_burst`（分多条带随机间隔）/ `qq_reply`（引用）/ `qq_send_poke` |
+| 读取 | `qq_get_unread_messages` / `qq_get_recent_messages` / `qq_wait_for_messages` |
+| 群管理 | `qq_list_groups` / `qq_get_group_members` / `qq_get_active_members` |
+| 资料 | `qq_set_signature` / `qq_set_profile` / `qq_set_avatar` / `qq_get_self_image` |
+| 空间 | `qq_post_qzone`（最多 9 图）/ `qq_delete_qzone` / `qq_comment_qzone` |
+| 表情 | `qq_list_stickers` / `qq_send_sticker` / `qq_collect_sticker` / `qq_sticker_note` |
+| 语音 | `qq_send_voice`（发语音库文件）/ `qq_list_voices` |
+| 记忆 | `qq_memory_append`（activeTopic / pendingThought / memberImpression）/ `qq_set_wake_config` |
+
+### 抖音（`mcp-douyin.js`，18 个工具）
+
+| 能力 | 工具 | 是否需要额外配置 |
+|---|---|---|
+| 读推荐流 / 详情 / 评论 / 搜索 | `douyin_feed` / `douyin_detail` / `douyin_comments` / `douyin_search` | Playwright + 浏览器 profile |
+| **听懂口播**（下载 + ASR 转写） | `douyin_transcribe` | 需 FunASR |
+| **解析别人发来的分享** | `douyin_read_share` | — |
+| **读私信并区分谁发的** | `douyin_read_im` | — |
+| **读 @ 提醒 / 评论回复** | `douyin_notifications` | — |
+| **列评论 + 精准回复** | `douyin_comment_list` / `douyin_reply` | 写操作需 `DOUYIN_ALLOW_WRITES=1` |
+| **发作品**（图文 / 视频 / 配乐） | `douyin_publish_images` / `douyin_publish` / `douyin_publish_auto` | 同上 |
+
+> 抖音全部走**浏览器自动化**（不是逆向接口）。抖音每个 web 接口都要 `a_bogus` 签名，只能借页面环境发请求。写操作走 UI 自动化。
+> 需要本机有可用的 Chromium 与抖音登录态；别人 clone 后这部分**代码可读但跑不起来**。
+
+### 语音（`mcp-voice-say.js`，5 个工具）
+
+| 工具 | 说明 | 依赖 |
+|---|---|---|
+| `qq_say` | 文本 → 语音条，支持情绪（soft/normal/lively/sleepy） | GPT-SoVITS + 参考音频 |
+| `qq_sing` | 给音频换音色 | RVC + `.pth` + `.index` |
+| `qq_song` | **点歌**：搜清唱素材 → 音高检测 → 自动变调 → 换音色 | bilibili-api + yt-dlp + RVC |
+| `qq_song_search` | 只搜不下 | bilibili-api |
+| `qq_tts_status` | 查 TTS 在线状态 | — |
+
+> `clip_seconds` 是**总共唱多少秒**，不是单段长度。传 120 会自动切成 2-3 条语音（每段 ≤55 秒，不顶 QQ 60 秒上限）。
+
+### 画图与视频（`mcp-comfyui.js`，7 个工具）
+
+| 工具 | 说明 |
+|---|---|
+| `comfy_generate` | 文生图 |
+| `comfy_video` | **文生视频**（Wan2.2），无声 mp4 |
+| `comfy_status` / `comfy_free` | 状态 / 释放显存 |
+
+> 视频很慢：720P/16fps 约 2 分钟出 1 秒。8 GB 卡默认 2 秒，工具会先查显存，不够直接拒绝。
+
+### 联网搜索（`mcp-web-search-safe.js`）
+
+`web_search` / `web_fetch`，带 SSRF 防护。
+
+## 依赖清单（按必需程度）
+
+### 必须
+
+| 组件 | 用途 | 版本 |
+|---|---|---|
+| Node.js | 运行时 | ≥ 22.13 |
+| DSH Desktop | Agent 运行时 | 0.2.0-rc.2 |
+| SnowLuma | QQ 网关（OneBot v11） | 最新 |
+| QQ NT | 被 Hook 注入 | — |
+
+### 可选（缺失时对应能力不可用）
+
+| 组件 | 影响的功能 | 备注 |
+|---|---|---|
+| Playwright + Chromium | 全部抖音能力 | `npx playwright install chromium` |
+| 抖音登录态 | 同上 | 手动登录一次，profile 存本地 |
+| GPT-SoVITS | `qq_say` 说话 | 需 8.75 秒参考音频 |
+| RVC + 音色模型 | `qq_sing` / `qq_song` 唱歌 | 需 `.pth` + 配套 `.index` |
+| bilibili-api-python | 点歌搜素材 | 建议单独 venv |
+| yt-dlp | 下载音频 | |
+| FFmpeg | 音频处理 | 需支持 h264 编码器 |
+| FunASR | `douyin_transcribe` / 语音转文字 | GPT-SoVITS 自带 |
+| ComfyUI | 画图 / 视频 | 需 Wan2.2 模型 |
+
+## 启动顺序（顺序错了连不上）
+
+```
+1. QQ 客户端（登录）
+2. SnowLuma（等到日志出现 "login detected"）
+3. DSH Desktop（等端口就绪）
+4. qq-bridge
+```
+
+## 已知问题
+
+**SnowLuma Hook 会退化。** 表现为：进程活着、端口通、API 正常、`get_status` 心跳有，但**收不到任何 QQ 消息事件**。
+
+这是外部依赖的缺陷，桥接无法自愈。唯一解是重启 QQ 让 SnowLuma 重新注入。
+
+本仓库的 `bridge.js` 已加入 token 自愈重试（解决另一类「重启后必断」），但 Hook 退化需要外部巡检。参考实现见 `hook-watchdog.mjs`（不在仓库内，需要时可按 HANDOVER.md 的思路自建）。
+
 ## 项目资料
 
+- [交接文档](HANDOVER.md) —— **架构图 + 18 个踩坑记录 + 部署步骤**（建议先读）
+- [增量说明](CHANGES.md) —— 相对上游做了什么、每个工具的实现细节
+- [给接手者](README-FOR-CODEX.md) —— 交付说明与优先事项
 - [本次修改记录](docs/IMPROVEMENTS.md)
 - [可选依赖与目录](docs/guides/VOICE.md)
 - [原项目权限边界](RULES.md)

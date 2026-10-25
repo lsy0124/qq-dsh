@@ -25,6 +25,10 @@ import { z } from 'zod';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 
+// douyin 核心脚本目录。随仓库分发（src/douyin/），不再依赖外部目录
+// ⚠️ 必须在使用之前定义（const 有暂时性死区）
+const DY_DIR = path.join(ROOT, 'douyin');
+
 // 验证码检测与通知（遇到风控时通过 QQ 把控制权交回本人）
 const captchaUrl = pathToFileURL(path.join(DY_DIR, 'douyin-captcha.mjs')).href;
 const { handleCaptcha, notifyOwner } = await import(captchaUrl);
@@ -33,8 +37,6 @@ const { handleCaptcha, notifyOwner } = await import(captchaUrl);
 async function checkCaptcha(page, context) {
   return handleCaptcha(page, { context });
 }
-// douyin 核心脚本现在随仓库分发（src/douyin/），不再依赖外部目录
-const DY_DIR = path.join(ROOT, 'src', 'douyin');
 
 function log(...a) {
   // stdio MCP：stdout 是协议通道，调试只能走 stderr
@@ -103,6 +105,28 @@ async function withReader(fn) {
 }
 
 const server = new McpServer({ name: 'douyin', version: '1.0.0' });
+
+// ── 写操作总开关 ───────────────────────────────────────────────────────────
+//
+// 抖音的「发评论 / 回复 / 发作品 / 发私信」是不可逆的公开操作，
+// 发出去所有粉丝都能看到，删不干净。
+//
+// 默认全部禁用，必须显式设置 DOUYIN_ALLOW_WRITES=1 才放行。
+const DOUYIN_WRITES_ALLOWED = process.env.DOUYIN_ALLOW_WRITES === '1';
+
+function assertWritesAllowed(toolName) {
+  if (DOUYIN_WRITES_ALLOWED) return null;
+  return {
+    content: [{
+      type: 'text',
+      text: `「${toolName}」属于抖音写操作，默认禁用。\n\n`
+        + '这会真的发到抖音上（评论 / 回复 / 作品），删不干净。\n\n'
+        + '确认要用的话，在拉起这个 MCP 的环境里设：\n'
+        + '  DOUYIN_ALLOW_WRITES=1\n',
+    }],
+    isError: true,
+  };
+}
 
 server.tool(
   'douyin_feed',
@@ -293,6 +317,9 @@ server.tool(
     text: z.string().min(1).max(500).describe('要发送的文字'),
   },
   async ({ to, text }) => {
+    // 写操作总开关
+    const denied = assertWritesAllowed('douyin_send_message');
+    if (denied) return denied;
     const res = await withReader(async (_reader, b) => {
       const { pathToFileURL } = await import('node:url');
       const { DouyinIM } = await import(pathToFileURL(path.join(DY_DIR, 'douyin-im.mjs')).href);
@@ -323,6 +350,9 @@ server.tool(
     note: z.string().max(200).optional().describe('可选：附在链接前的一句说明'),
   },
   async ({ to, aweme_id, note }) => {
+    // 写操作总开关
+    const denied = assertWritesAllowed('douyin_share_video');
+    if (denied) return denied;
     const res = await withReader(async (reader, b) => {
       const { pathToFileURL } = await import('node:url');
       const { DouyinIM } = await import(pathToFileURL(path.join(DY_DIR, 'douyin-im.mjs')).href);
@@ -397,6 +427,9 @@ server.tool(
     dry_run: z.boolean().optional().describe('只输入不发送，用于验证（默认 false）'),
   },
   async ({ aweme_id, text, at_names, dry_run }) => {
+    // 写操作总开关
+    const denied = assertWritesAllowed('douyin_comment');
+    if (denied) return denied;
     const res = await withReader(async (_reader, b) => {
       const { pathToFileURL } = await import('node:url');
       const mod = await import(pathToFileURL(path.join(DY_DIR, 'douyin-comment.mjs')).href);
@@ -617,6 +650,9 @@ server.tool(
     dry_run: z.boolean().optional().describe('只输入不发送，用于验证'),
   },
   async ({ aweme_id, reply_text, match_text, index, dry_run }) => {
+    // 写操作总开关
+    const denied = assertWritesAllowed('douyin_reply');
+    if (denied) return denied;
     const res = await withReader(async (_reader, b) => {
       const { pathToFileURL } = await import('node:url');
       const mod = await import(pathToFileURL(path.join(DY_DIR, 'douyin-comment.mjs')).href);
@@ -659,6 +695,9 @@ server.tool(
     dry_run: z.boolean().optional().describe('只上传不发布，默认 false'),
   },
   async ({ video_path, title, desc, music, dry_run }) => {
+    // 写操作总开关
+    const denied = assertWritesAllowed('douyin_publish');
+    if (denied) return denied;
     const res = await withReader(async (reader) => {
       return reader.publishVideo({
         videoPath: String(video_path),
@@ -713,6 +752,9 @@ server.tool(
     dry_run: z.boolean().optional().describe('只上传不发布，默认 false'),
   },
   async ({ image_paths, title, desc, music, dry_run }) => {
+    // 写操作总开关
+    const denied = assertWritesAllowed('douyin_publish_images');
+    if (denied) return denied;
     const res = await withReader(async (reader) => {
       return reader.publishImages({
         imagePaths: image_paths,
@@ -768,6 +810,9 @@ server.tool(
     dry_run: z.boolean().optional().describe('只上传不发布'),
   },
   async ({ theme, image_paths, title, desc, music, dry_run }) => {
+    // 写操作总开关
+    const denied = assertWritesAllowed('douyin_publish_auto');
+    if (denied) return denied;
     const fsx = await import('node:fs');
     const pathx = await import('node:path');
     const urlx = await import('node:url');
