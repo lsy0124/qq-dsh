@@ -264,7 +264,7 @@ server.tool(
       const { renderSing } = await import('./sing.mjs');
       const r = await renderSing(String(audio_path), {
         f0: f0 ?? 0,
-        clipSec: clip_seconds ?? 30,
+        clipSec: clip_seconds ?? 45,
         clipStart: clip_start ?? 8,
       });
 
@@ -348,6 +348,21 @@ server.tool(
       steps.push('选中：' + found.picked.title + '（' + found.picked.duration + '）');
       if (found.separated) steps.push("已分离人声（原曲带伴奏）");
 
+      // 智能推断时长：AI 没传 clip_seconds 时，按歌名/上下文猜
+      // （用户反馈「唱歌固定 30 秒」——因为 AI 经常不传参数就落到默认值）
+      let effectiveClip = clip_seconds;
+      if (effectiveClip === undefined || effectiveClip === null) {
+        const q = String(song || '') + ' ' + String(label || '');
+        if (/完整|整首|全曲|full/i.test(q)) {
+          effectiveClip = 130;          // 「唱完整首」
+        } else if (/几句|两句|一段|一小段/i.test(q)) {
+          effectiveClip = 25;           // 「唱几句」
+        } else {
+          effectiveClip = 45;           // 默认：一条语音，够听副歌
+        }
+        steps.push(`按歌名推断时长：${effectiveClip} 秒`);
+      }
+
       // 变调优先级：用户显式指定 > 自动检测 > 0
       const autoShift = found.pitch?.suggestedShift;
       const useF0 = (f0 !== undefined && f0 !== null) ? f0 : (autoShift ?? 0);
@@ -364,7 +379,7 @@ server.tool(
       steps.push('转换音色中…');
       const r = await renderSing(found.audioPath, {
         f0: useF0,
-        clipSec: clip_seconds ?? 30,
+        clipSec: effectiveClip,
         clipStart: clip_start ?? 8,
       });
 

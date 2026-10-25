@@ -76,3 +76,13 @@ __pycache__/
 _*.log
 _*.json
 coverage/
+
+# ── 音色参考音频（真人语音片段，含声音权与肖像风险，不入库）──
+audio-ref/
+
+# ── 本机临时脚本与缓存 ──
+_*.mjs
+_*.err
+src/__pycache__/
+__pycache__/
+*.pyc

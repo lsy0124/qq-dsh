@@ -12,7 +12,6 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import yaml from 'js-yaml';
-import { readLocalConfig } from './core/runtime-config.mjs';
 import { extractPresetPrefix, presetPromptBlockers, presetPromptWarnings, renderPresetPromptYaml } from './preset-prompt.js';
 import { GEN1_ROLE_LINE_RE, parseRoleSections, roleCharStats, roleSectionReport, selectRoleText } from './role-card.js';
 import { fileURLToPath } from 'node:url';
@@ -651,7 +650,7 @@ function normalizeIdList(value) {
 // ── 配置 ────────────────────────────────────────────────────────────────────
 function loadConfig() {
   const p = path.join(ROOT, 'config.json');
-  const file = readLocalConfig(ROOT, { required: true });
+  const file = readJsonSafe(p, null, true);
   if (!file || typeof file !== 'object' || Array.isArray(file)) throw new Error(`配置格式错误：${p}`);
   const cfg = {
     dsh: {
@@ -11852,6 +11851,30 @@ async function main() {
   }
 
   let tokenHealAt = 0;
+  // 自愈失败后的重试状态。
+  //
+  // 为什么需要它：桥接启动瞬间 SnowLuma 可能还没监听 3000 端口
+  // （重启顺序、SnowLuma 启动慢、或者它正在重注入 Hook），
+  // discoverSnowLumaConnection 会直接失败。原实现失败就放弃了，
+  // 于是「重启 DSH 后 QQ 必断」——必须人工重启桥接才好。
+  //
+  // 现在失败不放弃：退避重试，最后挂一个 30 秒后台定时器一直试到成功。
+  let healRetryTimer = null;
+  let healAttempt = 0;
+
+  function scheduleHealRetry(reason) {
+    if (healRetryTimer) return;              // 已排过，别叠加
+    healAttempt += 1;
+    // 前几次快（1s/2s/4s/8s），之后固定 30s
+    const delay = healAttempt <= 4 ? Math.min(1000 * 2 ** (healAttempt - 1), 8000) : 30000;
+    healRetryTimer = setTimeout(() => {
+      healRetryTimer = null;
+      tokenHealAt = 0;                       // 绕过 10 秒节流
+      healTokenIfStale(`retry#${healAttempt}`).catch(() => {});
+    }, delay);
+    log(`   ↻ ${(delay / 1000).toFixed(0)} 秒后重试自愈（第 ${healAttempt} 次）`);
+  }
+
   async function healTokenIfStale(reason) {
     const now = Date.now();
     if (now - tokenHealAt < 10000) return;   // 节流：close 事件会连续触发
@@ -11860,7 +11883,14 @@ async function main() {
       const r = await discoverSnowLumaConnection({ cfg, timeoutMs: 4000 });
       if (!r.ok) {
         log(`⚠️ token 自愈失败（${reason}）：${r.error}`);
+        scheduleHealRetry(reason);
         return;
+      }
+      // 成功：清掉重试状态
+      healAttempt = 0;
+      if (healRetryTimer) {
+        clearTimeout(healRetryTimer);
+        healRetryTimer = null;
       }
       await applyHealedTokens(r);
       log(`   自愈完成：账号 ${r.self?.user_id ?? '?'}（${reason}）`);

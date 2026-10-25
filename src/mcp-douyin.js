@@ -19,7 +19,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { fileURLToPath } from 'node:url';
-import { getRuntimePaths } from './core/runtime-config.mjs';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
@@ -27,24 +26,15 @@ import { z } from 'zod';
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 
 // 验证码检测与通知（遇到风控时通过 QQ 把控制权交回本人）
-const DY_DIR = getRuntimePaths().douyinDir;
-let captchaModule;
-async function getCaptchaModule() {
-  if (!captchaModule) {
-    const filename = path.join(DY_DIR, 'douyin-captcha.mjs');
-    if (!fs.existsSync(filename)) throw new Error('Optional Douyin adapter missing. Configure paths.douyinDir with your adapter installation.');
-    captchaModule = await import(pathToFileURL(filename).href);
-  }
-  return captchaModule;
-}
-async function handleCaptcha(...args) { return (await getCaptchaModule()).handleCaptcha(...args); }
-async function notifyOwner(...args) { return (await getCaptchaModule()).notifyOwner(...args); }
+const captchaUrl = pathToFileURL(path.join(DY_DIR, 'douyin-captcha.mjs')).href;
+const { handleCaptcha, notifyOwner } = await import(captchaUrl);
 
 /** 检测验证码；有就通知 QQ 并抛出可识别错误（不吞掉、不重试） */
 async function checkCaptcha(page, context) {
   return handleCaptcha(page, { context });
 }
-
+// douyin 核心脚本现在随仓库分发（src/douyin/），不再依赖外部目录
+const DY_DIR = path.join(ROOT, 'src', 'douyin');
 
 function log(...a) {
   // stdio MCP：stdout 是协议通道，调试只能走 stderr
@@ -242,8 +232,8 @@ server.tool(
   async ({ aweme_id }) => {
     const { spawnSync } = await import('node:child_process');
     const { pathToFileURL } = await import('node:url');
-    const PY = getRuntimePaths().asrPython;
-    const ASR = getRuntimePaths().asrScript;
+    const PY = process.env.TTS_PYTHON || path.resolve(ROOT, '..', '..', 'GPT-SoVITS', 'GPT-SoVITS-v2pro-20250604-nvidia50', 'runtime', 'python.exe');
+    const ASR = path.join(DY_DIR, 'douyin_transcribe.py');
     const MEDIA_DIR = path.join(DY_DIR, 'media');
 
     const res = await withReader(async (_reader, b) => {
@@ -299,11 +289,10 @@ server.tool(
   + '注意：抖音限制「对方回复或关注你之前只能发一条文字消息」，对不熟的人重复发会被拒。'
   + '发送会真的发出去，别用来刷屏。',
   {
-    to: z.string().min(1).describe('好友昵称（模糊匹配，如「示例昵称」）'),
+    to: z.string().min(1).describe('好友昵称（模糊匹配，如「未开封的汽水」）'),
     text: z.string().min(1).max(500).describe('要发送的文字'),
   },
   async ({ to, text }) => {
-    if (process.env.DOUYIN_ALLOW_WRITES !== '1') return {isError:true,content:[{type:'text',text:'Douyin write tools are disabled. Enable DOUYIN_ALLOW_WRITES only in your adapter process if intended.'}]};
     const res = await withReader(async (_reader, b) => {
       const { pathToFileURL } = await import('node:url');
       const { DouyinIM } = await import(pathToFileURL(path.join(DY_DIR, 'douyin-im.mjs')).href);
@@ -408,7 +397,6 @@ server.tool(
     dry_run: z.boolean().optional().describe('只输入不发送，用于验证（默认 false）'),
   },
   async ({ aweme_id, text, at_names, dry_run }) => {
-    if (!dry_run && process.env.DOUYIN_ALLOW_WRITES !== '1') return {isError:true,content:[{type:'text',text:'Douyin comments are disabled. Explicit adapter process opt-in is required.'}]};
     const res = await withReader(async (_reader, b) => {
       const { pathToFileURL } = await import('node:url');
       const mod = await import(pathToFileURL(path.join(DY_DIR, 'douyin-comment.mjs')).href);
@@ -513,6 +501,384 @@ server.tool(
       parts.push('', '（这个会话里没有可解析的视频分享）');
     }
     return { content: [{ type: 'text', text: parts.join('\n') }] };
+  },
+);
+
+// ── 读通知（@提醒 / 评论回复 / 点赞 / 关注）────────────────────────────────
+// 抖音没有推送 API，只能靠 UI：hover 右上角通知图标 → 解析弹出的面板。
+// 这是感知「有人在评论区 @ 我」的唯一方式。
+server.tool(
+  'douyin_notifications',
+  '读抖音通知：@提醒、评论回复、点赞、新粉丝。'
+  + '有人在你视频评论区 @ 你或回复你的评论时，这里能看到。'
+  + '抖音没有推送接口，所以这是被动查询 —— 想知道有没有人找你，主动调它。',
+  {
+    limit: z.number().int().min(1).max(50).optional().describe('最多读几条，默认 20'),
+    only_interaction: z.boolean().optional()
+      .describe('只看互动（评论/@/赞），过滤掉关注类，默认 false'),
+  },
+  async ({ limit, only_interaction }) => {
+    const res = await withReader(async (reader) => {
+      return reader.readNotifications({ limit: limit ?? 20 });
+    });
+
+    if (!res.ok) {
+      return { content: [{ type: 'text', text: `读取通知失败：${res.error}` }], isError: true };
+    }
+
+    const d = res.data;
+    if (!d.found) {
+      return { content: [{ type: 'text', text: '没打开通知面板（可能未登录，或页面没加载完）' }], isError: true };
+    }
+
+    let items = d.items || [];
+    if (only_interaction) items = items.filter((x) => ['回复评论', '@提醒', '点赞', '评论'].includes(x.action));
+
+    // 去掉重复项（同一人多条相同通知）
+    const uniq = [];
+    const seen = new Set();
+    for (const it of items) {
+      const key = it.text.slice(0, 60);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      uniq.push(it);
+    }
+
+    if (!uniq.length) {
+      return { content: [{ type: 'text', text: '暂时没有新通知。' }] };
+    }
+
+    const text = uniq.map((it, i) =>
+      `${i + 1}. [${it.action}] ${it.time ? it.time + ' · ' : ''}${it.text}`).join('\n');
+
+    const mentions = uniq.filter((x) => x.action === '@提醒' || x.action === '回复评论');
+    const head = mentions.length
+      ? `有 ${mentions.length} 条 @ 或评论回复：`
+      : `共 ${uniq.length} 条通知：`;
+
+    return { content: [{ type: 'text', text: `${head}\n\n${text}` }] };
+  },
+);
+
+// ── 回复别人的评论 ────────────────────────────────────────────────────────
+// 和 douyin_comment（发新评论）不同：这个是在某条已有评论下面回复，
+// 对方会收到「XX 回复了你的评论」的通知。
+server.tool(
+  'douyin_comment_list',
+  '列出视频下可回复的评论，带每条的位置。回复前先用它确认要回哪一条。',
+  {
+    aweme_id: z.string().min(1).describe('视频 ID'),
+    limit: z.number().int().min(1).max(30).optional().describe('最多列几条，默认 15'),
+  },
+  async ({ aweme_id, limit }) => {
+    const res = await withReader(async (_reader, b) => {
+      const { pathToFileURL } = await import('node:url');
+      const mod = await import(pathToFileURL(path.join(DY_DIR, 'douyin-comment.mjs')).href);
+      const cm = new mod.DouyinComment(b.page);
+
+      await b.page.goto(`https://www.douyin.com/video/${aweme_id}`, {
+        waitUntil: 'domcontentloaded', timeout: 60000,
+      });
+      await new Promise((r) => setTimeout(r, 5000));
+      return cm.listCommentTargets({ limit: limit ?? 15 });
+    });
+
+    if (!res.ok) return { content: [{ type: 'text', text: `读取失败：${res.error}` }], isError: true };
+    const d = res.data;
+    if (!d.comments?.length) {
+      return { content: [{ type: 'text', text: '没找到可回复的评论（评论区可能没展开）' }] };
+    }
+    // 输出带上昵称、时间、地区 —— 判断该回哪条时要看这些
+    const text = d.comments.map((c, i) => {
+      const meta = [c.time, c.region].filter(Boolean).join('·');
+      const authorMark = c.isAuthor ? ' [作者]' : '';
+      return `${i + 1}. [${c.nick}]${authorMark} ${c.text}${meta ? `（${meta}）` : ''}`;
+    }).join('\n');
+
+    return {
+      content: [{
+        type: 'text',
+        text: `评论 ${d.comments.length} 条：\n\n${text}\n\n` +
+          '回复时可以用 match_text 指定这人的话里包含的片段，或用 index（从 0 开始）指定第几条。',
+      }],
+    };
+  },
+);
+
+server.tool(
+  'douyin_reply',
+  '回复抖音视频下的某条评论（对方会收到回复通知）。'
+  + '用 match_text 指定要回复哪条（该评论里包含的文字），或用 index 指定第几条。',
+  {
+    aweme_id: z.string().min(1).describe('视频 ID'),
+    reply_text: z.string().min(1).max(200).describe('回复内容'),
+    match_text: z.string().optional().describe('要回复的评论里包含的文字（模糊匹配）'),
+    index: z.number().int().min(0).max(30).optional().describe('或直接指定第几条（从 0 开始，默认 0）'),
+    dry_run: z.boolean().optional().describe('只输入不发送，用于验证'),
+  },
+  async ({ aweme_id, reply_text, match_text, index, dry_run }) => {
+    const res = await withReader(async (_reader, b) => {
+      const { pathToFileURL } = await import('node:url');
+      const mod = await import(pathToFileURL(path.join(DY_DIR, 'douyin-comment.mjs')).href);
+      const cm = new mod.DouyinComment(b.page);
+
+      await b.page.goto(`https://www.douyin.com/video/${aweme_id}`, {
+        waitUntil: 'domcontentloaded', timeout: 60000,
+      });
+      await new Promise((r) => setTimeout(r, 5000));
+
+      return cm.replyToComment({
+        matchText: match_text,
+        replyText: String(reply_text),
+        index: index ?? 0,
+        dryRun: dry_run === true,
+      });
+    });
+
+    if (!res.ok) return { content: [{ type: 'text', text: `回复失败：${res.error}` }], isError: true };
+    return { content: [{ type: 'text', text: JSON.stringify(res.data, null, 2) }] };
+  },
+);
+
+// ── 发布作品 ───────────────────────────────────────────────────────────────
+// 链路：点首页「投稿」→ 打开 creator.douyin.com → setInputFiles 上传 → 填标题 → 点发布。
+// 支持格式：mp4/mov/avi/mkv/webm/flv，1 小时以内、16G 以内。
+// 这是不可逆的公开操作，所以默认 dry_run=false 但会在描述里强调。
+server.tool(
+  'douyin_publish',
+  '发布抖音作品（视频）。传本地视频文件路径 + 标题/话题。'
+  + '**这是公开发布，发出去所有粉丝都能看到**，不是草稿。所以：'
+  + '① 只在对方明确要求时调；② 标题要真的像人写的，别堆砌关键词；'
+  + '③ 拿不准就先 dry_run=true 只上传不发布，回报结果让人确认。',
+  {
+    video_path: z.string().min(1).describe('视频文件的本地绝对路径'),
+    title: z.string().max(50).optional().describe('**标题**（短，一句话，约 20 字内）。和描述是两个不同的框'),
+    desc: z.string().max(1000).optional().describe('**描述**（长，可写几段话 + #话题）。留空则只填标题'),
+    music: z.string().max(60).optional()
+      .describe('背景音乐：传歌名或风格关键词（如「轻音乐」「周杰伦」）。留空则不配乐。关键词越准越容易搜到'),
+    dry_run: z.boolean().optional().describe('只上传不发布，默认 false'),
+  },
+  async ({ video_path, title, desc, music, dry_run }) => {
+    const res = await withReader(async (reader) => {
+      return reader.publishVideo({
+        videoPath: String(video_path),
+        title: title || '',
+        desc: desc || '',
+        music: music || '',
+        dryRun: dry_run === true,
+      });
+    });
+
+    if (!res.ok) {
+      return { content: [{ type: 'text', text: `发布失败：${res.error}` }], isError: true };
+    }
+
+    const d = res.data;
+    if (d.error) {
+      return { content: [{ type: 'text', text: `发布未完成：${d.error}` }], isError: true };
+    }
+
+    if (d.dryRun) {
+      return {
+        content: [{
+          type: 'text',
+          text: `已上传到编辑界面（未发布）。\n标题：${d.title}\n\n确认要发的话，把 dry_run 去掉再调一次。`,
+        }],
+      };
+    }
+
+    return {
+      content: [{
+        type: 'text',
+        text: d.published
+          ? `已发布！\n标题：${d.title}\n最终页面：${d.finalUrl}`
+          : `上传成功但发布状态不确定。页面提示：${d.pageText}`,
+      }],
+    };
+  },
+);
+
+server.tool(
+  'douyin_publish_images',
+  '发布抖音图文作品（多张图片 + 一段文字）。'
+  + '比发视频轻量得多，适合随手记录：今天看到什么、想到什么、拍到了什么。'
+  + '图片 1-9 张，单张 ≤50MB，支持 png/jpg/jpeg/webp/bmp。'
+  + '**这是公开发布**，所有粉丝能看到。dry_run=true 可以只上传不发布。',
+  {
+    image_paths: z.array(z.string()).min(1).max(9).describe('图片的本地绝对路径数组（1-9 张）'),
+    title: z.string().max(50).optional().describe('**标题**（短，一句话，约 20 字内）'),
+    desc: z.string().max(1000).optional().describe('**描述**（长，可写几段话 + #话题）'),
+    music: z.string().max(60).optional()
+      .describe('背景音乐：传歌名或风格关键词（如「轻音乐」「周杰伦」）。留空则不配乐。关键词越准越容易搜到'),
+    dry_run: z.boolean().optional().describe('只上传不发布，默认 false'),
+  },
+  async ({ image_paths, title, desc, music, dry_run }) => {
+    const res = await withReader(async (reader) => {
+      return reader.publishImages({
+        imagePaths: image_paths,
+        title: title || '',
+        desc: desc || '',
+        music: music || '',
+        dryRun: dry_run === true,
+      });
+    });
+
+    if (!res.ok) return { content: [{ type: 'text', text: `发布失败：${res.error}` }], isError: true };
+    const d = res.data;
+    if (d.error) return { content: [{ type: 'text', text: `未完成：${d.error}` }], isError: true };
+
+    if (d.dryRun) {
+      return {
+        content: [{
+          type: 'text',
+          text: `已上传 ${d.imageCount} 张图到编辑界面（未发布）。\n配文：${d.title}`,
+        }],
+      };
+    }
+
+    return {
+      content: [{
+        type: 'text',
+        text: d.published
+          ? `已发布！${d.imageCount} 张图\n配文：${d.title}`
+          : `上传成功但发布状态不确定：${d.pageText}`,
+      }],
+    };
+  },
+);
+
+// ── 一步到位：配图（没有就生成）+ 发布 ──────────────────────────────────────
+// 用户要求：「发布和主题一致的图或视频，没有的话就生成」。
+// 这个工具把「找素材 → 配文 → 发布」合成一步，减少出错环节。
+server.tool(
+  'douyin_publish_auto',
+  '发一条图文作品，自动保证配图和主题一致：传了图片就用，没传就按主题现画。'
+  + '这是发日常动态的**首选**方式。只给 theme（主题）就行，图会自动配。',
+  {
+    theme: z.string().min(1).max(200)
+      .describe('这条动态的主题/内容，一句话说清楚。配图会按它生成。例：傍晚的云，橘红色一片'),
+    image_paths: z.array(z.string()).max(9).optional()
+      .describe('可选：已有的图片路径。不给就按 theme 自动生成'),
+    title: z.string().max(50).optional()
+      .describe('标题（短，默认取 theme 的浓缩版）'),
+    desc: z.string().max(1000).optional()
+      .describe('描述（长，可写感受 + #话题）。不给就用 theme 展开'),
+    music: z.string().max(60).optional()
+      .describe('背景音乐关键词（如「轻音乐」「钢琴」）。留空不配乐'),
+    dry_run: z.boolean().optional().describe('只上传不发布'),
+  },
+  async ({ theme, image_paths, title, desc, music, dry_run }) => {
+    const fsx = await import('node:fs');
+    const pathx = await import('node:path');
+    const urlx = await import('node:url');
+
+    let imgs = Array.isArray(image_paths) ? image_paths.filter((p) => fsx.existsSync(p)) : [];
+    const steps = [];
+
+    // 1. 没有可用图 → 按主题生成
+    if (!imgs.length) {
+      steps.push('没有现成图片，按主题生成');
+      try {
+        // 直接复用本目录的 comfyui MCP 的 HTTP 接口
+        const COMFY = process.env.COMFY_URL || 'http://127.0.0.1:8188';
+        const OUT_DIR = pathx.join(DY_DIR, '..', 'qq-bridge', 'state', 'comfy-out');
+        fsx.mkdirSync(OUT_DIR, { recursive: true });
+
+        // 先查模型名
+        const info = await fetch(`${COMFY}/object_info`, { signal: AbortSignal.timeout(30000) }).then((r) => r.json());
+        const unet = info?.UNETLoader?.input?.required?.unet_name?.[0]?.[0];
+        const clip = info?.CLIPLoader?.input?.required?.clip_name?.[0]?.[0];
+        const vae = info?.VAELoader?.input?.required?.vae_name?.[0]?.[0];
+        if (!unet || !clip || !vae) throw new Error('ComfyUI 模型清单不全');
+
+        const seed = Math.floor(Math.random() * 1e15);
+        const workflow = {
+          '1': { class_type: 'UNETLoader', inputs: { unet_name: unet, weight_dtype: 'default' } },
+          '2': { class_type: 'CLIPLoader', inputs: { clip_name: clip, type: 'wan', device: 'default' } },
+          '3': { class_type: 'VAELoader', inputs: { vae_name: vae } },
+          '4': { class_type: 'CLIPTextEncode', inputs: { text: theme, clip: ['2', 0] } },
+          '5': { class_type: 'CLIPTextEncode', inputs: { text: 'low quality, blurry, watermark, text', clip: ['2', 0] } },
+          '6': { class_type: 'EmptyLatentImage', inputs: { width: 768, height: 1024, batch_size: 1 } },
+          '7': { class_type: 'KSampler', inputs: { seed, steps: 22, cfg: 5, sampler_name: 'euler', scheduler: 'normal', denoise: 1, model: ['1', 0], positive: ['4', 0], negative: ['5', 0], latent_image: ['6', 0] } },
+          '8': { class_type: 'VAEDecode', inputs: { samples: ['7', 0], vae: ['3', 0] } },
+          '9': { class_type: 'SaveImage', inputs: { images: ['8', 0], filename_prefix: `auto-${Date.now()}` } },
+        };
+
+        const q = await fetch(`${COMFY}/prompt`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ prompt: workflow, client_id: `autopost-${process.pid}` }),
+          signal: AbortSignal.timeout(30000),
+        }).then((r) => r.json());
+        if (q?.node_errors && Object.keys(q.node_errors).length) {
+          throw new Error('工作流被拒: ' + JSON.stringify(q.node_errors).slice(0, 150));
+        }
+
+        // 等生成完
+        const pid = q.prompt_id;
+        let entry = null;
+        for (let i = 0; i < 80; i++) {
+          await new Promise((r) => setTimeout(r, 3000));
+          const hist = await fetch(`${COMFY}/history/${pid}`, { signal: AbortSignal.timeout(15000) }).then((r) => r.json());
+          entry = hist?.[pid];
+          if (entry) break;
+        }
+        if (!entry) throw new Error('生成超时');
+
+        // 拿到文件名
+        const outs = entry.outputs || {};
+        let fileName = null;
+        for (const o of Object.values(outs)) {
+          const f = (o.images || [])[0];
+          if (f?.filename) { fileName = f.filename; break; }
+        }
+        if (!fileName) throw new Error('生成完成但没找到文件');
+
+        // 从 ComfyUI 下载到本地
+        const dl = `${COMFY}/view?filename=${encodeURIComponent(fileName)}&type=output`;
+        const buf = Buffer.from(await fetch(dl, { signal: AbortSignal.timeout(60000) }).then((r) => r.arrayBuffer()));
+        const local = pathx.join(OUT_DIR, `auto-${Date.now()}.png`);
+        fsx.writeFileSync(local, buf);
+        imgs = [local];
+        steps.push(`自动生成配图：${pathx.basename(local)}`);
+
+        // 释放显存
+        fetch(`${COMFY}/free`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ unload_models: true, free_memory: true }),
+        }).catch(() => {});
+      } catch (e) {
+        return {
+          content: [{ type: 'text', text: `自动配图失败：${String(e?.message ?? e).slice(0, 150)}\n可以先用 comfy_generate 画一张，再传 image_paths。` }],
+          isError: true,
+        };
+      }
+    } else {
+      steps.push(`用已有图片 ${imgs.length} 张`);
+    }
+
+    // 2. 发布
+    const res = await withReader(async (reader) => {
+      return reader.publishImages({
+        imagePaths: imgs,
+        title: title || theme.slice(0, 20),
+        desc: desc || theme,
+        music: music || '',
+        dryRun: dry_run === true,
+      });
+    });
+
+    if (!res.ok) return { content: [{ type: 'text', text: `发布失败：${res.error}` }], isError: true };
+    const d = res.data;
+    if (d.error) return { content: [{ type: 'text', text: `未完成：${d.error}` }], isError: true };
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({ ...d, 步骤: steps, 图片: imgs }, null, 2),
+      }],
+    };
   },
 );
 

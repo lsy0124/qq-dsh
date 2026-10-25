@@ -114,6 +114,101 @@ function buildWorkflow({ prompt, negative, width, height, steps, cfg, seed, unet
   };
 }
 
+
+/**
+ * 组装视频生成 workflow（API 格式）。
+ *
+ * 和图片 workflow 的区别：
+ *   EmptyLatentImage  → WanImageToVideo（latent 带时间维度）
+ *   SaveImage         → VHS_VideoCombine（合成 mp4）
+ *
+ * length 是帧数，按 fps 换算成秒：length = seconds * fps
+ * 8 GB 卡上，5 秒 480p 大约要 3-6 分钟，别一次要太长。
+ */
+function buildVideoWorkflow({
+  prompt, negative, width, height, length, fps, steps, cfg, seed,
+  unet, clip, vae, filenamePrefix, startImage,
+}) {
+  const wf = {
+    '1': { class_type: 'UNETLoader', inputs: { unet_name: unet, weight_dtype: 'default' } },
+    '2': { class_type: 'CLIPLoader', inputs: { clip_name: clip, type: 'wan', device: 'default' } },
+    '3': { class_type: 'VAELoader', inputs: { vae_name: vae } },
+    '4': { class_type: 'CLIPTextEncode', inputs: { text: prompt, clip: ['2', 0] } },
+    '5': { class_type: 'CLIPTextEncode', inputs: { text: negative, clip: ['2', 0] } },
+    '6': {
+      class_type: 'WanImageToVideo',
+      inputs: {
+        positive: ['4', 0],
+        negative: ['5', 0],
+        vae: ['3', 0],
+        width,
+        height,
+        length,
+        batch_size: 1,
+      },
+    },
+    '7': {
+      class_type: 'KSampler',
+      inputs: {
+        seed,
+        steps,
+        cfg,
+        sampler_name: 'euler',
+        scheduler: 'simple',
+        denoise: 1,
+        model: ['1', 0],
+        positive: ['6', 0],
+        negative: ['6', 1],
+        latent_image: ['6', 2],
+      },
+    },
+    '8': { class_type: 'VAEDecode', inputs: { samples: ['7', 0], vae: ['3', 0] } },
+    '9': {
+      class_type: 'VHS_VideoCombine',
+      inputs: {
+        images: ['8', 0],
+        frame_rate: fps,
+        loop_count: 0,
+        filename_prefix: filenamePrefix,
+        format: 'video/h264-mp4',
+        pingpong: false,
+        save_output: true,
+      },
+    },
+  };
+
+  // 有起始图就接上（图生视频）
+  if (startImage) {
+    wf['10'] = { class_type: 'LoadImage', inputs: { image: startImage } };
+    wf['6'].inputs.start_image = ['10', 0];
+  }
+
+  return wf;
+}
+
+
+/**
+ * 查空闲显存（MB）。失败返回 null。
+ *
+ * 为什么需要：实测这台 8GB 卡跑视频容易爆显存。
+ * 与其生成两分钟崩掉，不如开始前查一下 —— 不够就直接说清楚要关什么。
+ */
+async function checkVramFree() {
+  const { spawn } = await import('node:child_process');
+  return new Promise((resolve) => {
+    const p = spawn('nvidia-smi', [
+      '--query-gpu=memory.free', '--format=csv,noheader,nounits',
+    ], { windowsHide: true });
+    let buf = '';
+    p.stdout.on('data', (d) => { buf += d.toString(); });
+    p.on('close', () => {
+      const n = parseInt(String(buf).trim().split('\n')[0], 10);
+      resolve(Number.isFinite(n) ? n : null);
+    });
+    p.on('error', () => resolve(null));
+  });
+}
+
 async function waitForHistory(promptId, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -367,6 +462,173 @@ server.tool('tts_synthesize','合成一段语音到语音库，返回 file 文�
   try{return {content:[{type:'text',text:JSON.stringify(await synthesizeSpeech(text))}]};}
   catch(e){return {isError:true,content:[{type:'text',text:String(e.message)}]};}
 });
+// ── 文生视频 ───────────────────────────────────────────────────────────────
+// 这台机器上装的全是视频模型（wan2.2_ti2v_5B / MiniMax H3），所以视频才是主场。
+// 用 WanImageToVideo（latent 带时间维度）+ VHS_VideoCombine 出 mp4。
+// 8GB 卡上：3 秒 480p 约 1-2 分钟，5 秒约 3-6 分钟。别一次要太长。
+server.tool(
+  'comfy_video',
+  '用本机 ComfyUI 生成一段无声短视频（mp4），适合做抖音作品素材。'
+  + '**很慢**：实测 720P/16fps 约 2 分钟一秒，默认 2 秒要 4 分钟左右。'
+  + '**容易爆显存**：8GB 卡别超过 3 秒，也别上 720P。'
+  + '所以只在对方明确要视频时才用；只是想发个动态，图文更快也更稳。',
+  {
+    prompt: z.string().min(1).describe('画面描述（英文通常更准）'),
+    negative: z.string().optional().describe('负向提示词'),
+    seconds: z.number().min(1).max(5).optional().describe('时长秒数，默认 2。实测 720P/16fps 约 2 分钟一秒，8GB 卡超过 5 秒极易爆显存'),
+    fps: z.number().int().min(8).max(30).optional().describe('帧率，默认 16'),
+    width: z.number().int().min(256).max(720).optional().describe('宽，默认 432（竖版 9:16）。720P 太吃显存'),
+    height: z.number().int().min(256).max(1280).optional().describe('高，默认 768（竖版，适合抖音）'),
+    steps: z.number().int().min(4).max(50).optional().describe('采样步数，默认 20'),
+    cfg: z.number().min(0).max(20).optional().describe('CFG，默认 5'),
+    seed: z.number().int().optional().describe('随机种子'),
+    unet: z.string().optional().describe('UNET 模型名，省略用默认'),
+    clip: z.string().optional().describe('CLIP 名，省略用默认'),
+    vae: z.string().optional().describe('VAE 名，省略用默认'),
+    freeAfter: z.boolean().optional().describe('出片后释放显存，默认 true'),
+  },
+  async (args) => {
+    const releaseMediaLock = await acquireMediaLock();
+    try {
+      const { online, error } = await comfyOnline();
+      if (!online) {
+        return { content: [{ type: 'text', text: `ComfyUI 离线：${error}` }], isError: true };
+      }
+
+      // 显存预检：视频比图片吃得多，实测容易 OOM
+      // 经验值：432x768 的 2 秒视频约需 4.5 GB 空闲
+      const freeMB = await checkVramFree();
+      const needMB = 4500;
+      if (freeMB !== null && freeMB < needMB) {
+        // 先试着让 ComfyUI 释放缓存
+        try {
+          await jsonFetch(`${COMFY}/free`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ unload_models: true, free_memory: true }),
+          }, 15000);
+          await new Promise((r) => setTimeout(r, 3000));
+        } catch {}
+
+        const recheck = await checkVramFree();
+        if (recheck !== null && recheck < needMB) {
+          return {
+            content: [{
+              type: 'text',
+              text: `显存不够，生成视频会失败。\n`
+                + `当前空闲 ${recheck} MB，至少需要 ${needMB} MB。\n\n`
+                + `请先关掉这些占显存的程序再试：\n`
+                + `· GPT-SoVITS（约 1-2 GB）\n`
+                + `· RVC webui（约 1 GB）\n`
+                + `· 其他 ComfyUI 任务\n`
+                + `或者把 seconds 降到 1、分辨率降到 384x672 再试。`,
+            }],
+            isError: true,
+          };
+        }
+      }
+
+      const fps = args.fps ?? 16;
+      const seconds = Math.min(args.seconds ?? 2, 5);
+      // length 必须是 4 的倍数 + 1（Wan 的约束），向下取整
+      const rawLen = Math.round(seconds * fps);
+      const length = Math.max(9, Math.floor(rawLen / 4) * 4 + 1);
+      const width = args.width ?? 432;
+      const height = args.height ?? 768;
+      const seed = args.seed ?? Math.floor(Math.random() * 1e15);
+
+      const workflow = buildVideoWorkflow({
+        prompt: args.prompt,
+        negative: args.negative ?? DEFAULT_NEGATIVE,
+        width: Math.floor(width / 16) * 16,
+        height: Math.floor(height / 16) * 16,
+        length,
+        fps,
+        steps: args.steps ?? 20,
+        cfg: args.cfg ?? 5,
+        seed,
+        unet: args.unet ?? DEFAULT_UNET,
+        clip: args.clip ?? DEFAULT_CLIP,
+        vae: args.vae ?? DEFAULT_VAE,
+        filenamePrefix: `qqvideo_${Date.now()}`,
+      });
+
+      log('提交视频任务 seed=', seed, `${width}x${height} ${length}帧 ≈ ${(length / fps).toFixed(1)}s`);
+      const queued = await jsonFetch(`${COMFY}/prompt`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ prompt: workflow, client_id: `qqbridge-${process.pid}` }),
+      }, 30000);
+
+      if (queued?.node_errors && Object.keys(queued.node_errors).length) {
+        return {
+          content: [{
+            type: 'text',
+            text: `工作流被拒绝：` + JSON.stringify(queued.node_errors, null, 2),
+          }],
+          isError: true,
+        };
+      }
+
+      const promptId = queued?.prompt_id;
+      if (!promptId) {
+        return { content: [{ type: 'text', text: '提交失败：没有拿到 prompt_id' }], isError: true };
+      }
+
+      // 视频比图片慢得多，给 20 分钟
+      const timeoutMs = 20 * 60 * 1000;
+      const entry = await waitForHistory(promptId, timeoutMs);
+      if (entry?.error) {
+        return { content: [{ type: 'text', text: `生成失败：${entry.error}` }], isError: true };
+      }
+
+      if (args.freeAfter !== false) {
+        try {
+          await jsonFetch(`${COMFY}/free`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ unload_models: true, free_memory: true }),
+          }, 15000);
+        } catch {}
+      }
+
+      const outputs = entry?.outputs ?? {};
+      const files = [];
+      for (const nodeOut of Object.values(outputs)) {
+        const list = nodeOut.gifs || nodeOut.videos || nodeOut.images || [];
+        for (const f of list) {
+          if (f?.filename) files.push(f);
+        }
+      }
+
+      if (!files.length) {
+        return { content: [{ type: 'text', text: '生成完成但没找到输出文件' }], isError: true };
+      }
+
+      const f = files[0];
+      const url = `${COMFY}/view?filename=${encodeURIComponent(f.filename)}&subfolder=${encodeURIComponent(f.subfolder || '')}&type=${f.type || 'output'}`;
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            ok: true,
+            文件: f.filename,
+            子目录: f.subfolder || '',
+            下载地址: url,
+            时长秒: Math.round((length / fps) * 10) / 10,
+            分辨率: `${width}x${height}`,
+            帧数: length,
+            帧率: fps,
+          }, null, 2),
+        }],
+      };
+    } finally {
+      releaseMediaLock();
+    }
+  },
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);
 log('comfyui MCP server 就绪，ComfyUI =', COMFY);

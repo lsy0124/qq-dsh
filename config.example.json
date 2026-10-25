@@ -15,19 +15,23 @@
   "snowluma": {
     "wsUrl": "ws://127.0.0.1:3001",
     "httpUrl": "http://127.0.0.1:3000",
-    "accessToken": "",
+    "accessToken": "<YOUR_ONEBOT_TOKEN>",
     "followDiscoveredEndpoint": true,
     "silenceWarnMs": 600000,
-    "launcherPath": "",
-    "homeDir": ""
+    "launcherPath": "D:/Users/未开封的汽水/Documents/Downloads/新建文件夹/SnowLuma/launcher.bat",
+    "homeDir": "D:/Users/未开封的汽水/Documents/Downloads/新建文件夹/SnowLuma"
   },
-  "ownerQQ": null,
-  "sessionCwd": "",
+  "ownerQQ": 100000000,
+  "sessionCwd": "D:/Users/未开封的汽水/Documents/Downloads/新建文件夹",
   "agentPreset": "qq-chat",
   "workspaceTitle": "QQ 聊天",
   "allow": {
-    "private": [],
-    "groups": []
+    "private": [
+      100000000
+    ],
+    "groups": [
+      1000000000
+    ]
   },
   "deny": {
     "private": [],
@@ -85,7 +89,7 @@
     "activeCheckMaxMs": 30000,
     "idleWindowMs": 360000,
     "idleRetryProbability": 0.4,
-    "proactiveEnabled": false,
+    "proactiveEnabled": true,
     "proactiveIdleThresholdMs": 1800000,
     "proactiveCheckMinMs": 2700000,
     "proactiveCheckMaxMs": 5400000,
@@ -140,7 +144,7 @@
       "stickerNote": true,
       "collectSticker": true,
       "getSelfImage": true,
-      "sendVoice": false
+      "sendVoice": true
     },
     "wake": {
       "defaultMode": "diving",
@@ -219,7 +223,7 @@
       }
     },
     "voice": {
-      "enabled": false,
+      "enabled": true,
       "dir": "audio",
       "maxSeconds": 300,
       "maxBytes": 20971520,
@@ -229,10 +233,10 @@
       "defaultVolume": 1,
       "loudness": "normal",
       "ffmpegPath": "",
-      "autoReadback": false
+      "autoReadback": true
     },
     "proactive": {
-      "enabled": false,
+      "enabled": true,
       "checkIntervalMinMs": 600000,
       "checkIntervalMaxMs": 1800000,
       "idleThresholdMs": 480000,
@@ -261,7 +265,7 @@
   "webSearch": {
     "provider": "auto",
     "apiKey": "",
-    "apiKeyEnv": "SEARCH_API_KEY",
+    "apiKeyEnv": "<YOUR_APIKEYENV>",
     "baseURL": "",
     "model": "deepseek-v4-flash",
     "maxUses": 5,
@@ -272,31 +276,24 @@
   "tts": {
     "baseUrl": "http://127.0.0.1:9880",
     "refAudio": "audio-ref/reference-zh.wav",
-    "promptText": "",
+    "promptText": "礼物我得写还有所有没有写到礼物的宝贝今天不好意思因为有活动各方面的事情没有好盯的这个",
     "promptLang": "zh",
     "textLang": "zh",
     "consolePort": 3100
   },
   "comfyui": {
     "baseUrl": "http://127.0.0.1:8188",
-    "launcher": "",
+    "launcher": "D:/ComfyUI_windows_portable_nvidia/ComfyUI_windows_portable/run_nvidia_gpu.bat",
     "defaultUnet": "wan2.2_ti2v_5B_fp16.safetensors",
     "defaultClip": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
     "defaultVae": "wan2.2_vae.safetensors",
     "freeAfterGenerate": true
   },
   "paths": {
-    "biliPython": "",
-    "ffmpeg": "",
-    "ffprobe": "",
-    "rvcDir": "",
-    "rvcScriptsDir": "",
-    "rvcPython": "",
-    "rvcInferScript": "",
-    "rvcOutputDir": "",
-    "asrPython": "",
-    "asrScript": "",
-    "douyinDir": "",
-    "voiceLibrary": ""
+    "_comment": "以下路径按需修改；留空则按默认逻辑推断",
+    "biliPython": "<BILI_VENV_PYTHON>",
+    "ytdlp": "<YTDLP_PATH>",
+    "ffmpeg": "<FFMPEG_PATH>",
+    "rvcDir": "<RVC_DIR>"
   }
 }

@@ -2,9 +2,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { getRuntimePaths } from './core/runtime-config.mjs';
-import { runMediaProcess as run } from './core/media-process.mjs';
-import { scoreItem } from './core/song-selection.mjs';
 
 // 点歌自动化：歌名 → 搜索 → 挑素材 → 下载 → （必要时分离人声）→ RVC 换音色 → 发 QQ
 //
@@ -19,19 +16,171 @@ const ROOT = path.resolve(HERE, '..');
 
 // bili 虚拟环境的 python（跑 sing_search.py 用）。
 // 优先读 config.json 的 paths.biliPython，其次环境变量 BILI_PYTHON，最后回退到常见位置。
-const runtimePaths = getRuntimePaths();
-const BILI_PY = runtimePaths.biliPython;
-const RVC_APP = runtimePaths.rvcDir;
-const RVC_PY = runtimePaths.rvcPython;
+const BILI_PY = (() => {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(ROOT, 'config.json'), 'utf8'));
+    if (cfg.paths?.biliPython) return cfg.paths.biliPython;
+  } catch {}
+  if (process.env.BILI_PYTHON) return process.env.BILI_PYTHON;
+  return path.join(process.env.APPDATA || '', 'dsh-desktop', 'harness', 'bili-duty', '.venv', 'Scripts', 'python.exe');
+})();
+const RVC_APP = path.join(ROOT, '..', 'RVC', 'RVC20260718Nvidia50x0');
+const RVC_PY = path.join(RVC_APP, 'runtime', 'python.exe');
 const RVC_CWD = RVC_APP;
 const DOWNLOAD_DIR = path.join(ROOT, 'state', 'sing-dl');
 const SEARCH_SCRIPT = path.join(HERE, 'sing_search.py');
 
-/** Compatibility: only the current job's owned children may be terminated. */
-export async function killStalePython() { return { skipped: true }; }
+/**
+ * 杀掉整个进程树（Windows）。
+ *
+ * 为什么必须这么做：p.kill() 只杀直接子进程，Python 派生的 CUDA 上下文会活下来
+ * 继续占显存。实测三次中断就能吃满 8GB 卡，之后 RVC 从 GPU 掉到 CPU，
+ * 合成耗时从 7 秒变成 485 秒。
+ */
+function killTree(pid) {
+  if (!pid) return;
+  try {
+    // taskkill /T 连子进程一起杀，/F 强制
+    spawn('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+  } catch {
+    try { process.kill(pid, 'SIGKILL'); } catch {}
+  }
+}
+
+/**
+ * 收工前清掉上一次中断留下的僵尸 Python 进程。
+ * 它们不会自己退出，会一直占着显存。
+ */
+export function killStalePython(pattern) {
+  try {
+    const { execSync } = require('node:child_process');
+  } catch {}
+  // 用 wmic 查（不引依赖）
+  return new Promise((resolve) => {
+    const p = spawn('powershell', [
+      '-NoProfile', '-Command',
+      `Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object { $_.CommandLine -like '*${pattern}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`,
+    ], { windowsHide: true, stdio: 'ignore' });
+    p.on('close', () => resolve());
+    p.on('error', () => resolve());
+  });
+}
 
 function log(...a) {
   console.error('[song]', ...a);
+}
+
+function run(cmd, args, { cwd, env = {}, timeoutMs = 900000 } = {}) {
+  return new Promise((resolve) => {
+    const p = spawn(cmd, args, {
+      cwd: cwd || undefined,
+      env: { ...process.env, PYTHONUTF8: '1', ...env },
+      windowsHide: true,
+    });
+    let out = '';
+    let err = '';
+    const timer = setTimeout(() => {
+      try { killTree(p.pid); } catch {}
+      resolve({ code: -1, stdout: out, stderr: `${err}\n[超时]` });
+    }, timeoutMs);
+    p.stdout.on('data', (d) => { out += d.toString('utf8'); });
+    p.stderr.on('data', (d) => { err += d.toString('utf8'); });
+    p.on('close', (code) => { clearTimeout(timer); resolve({ code: code ?? -1, stdout: out, stderr: err }); });
+    p.on('error', (e) => { clearTimeout(timer); resolve({ code: -1, stdout: out, stderr: String(e?.message ?? e) }); });
+  });
+}
+
+/** 解析 "3:12" / "59:33" / "1:02:03" 成秒 */
+function parseDuration(s) {
+  if (!s) return 0;
+  const parts = String(s).split(':').map(Number);
+  if (parts.some((n) => Number.isNaN(n))) return 0;
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  return parts[0] || 0;
+}
+
+/**
+ * 给搜索结果打分。目标是挑「最适合换音色」的那条：
+ *   · 清唱/无伴奏 > 原曲（省掉分离，音质也更干净）
+ *   · 时长 40 秒 ~ 5 分钟（太短没内容，太长转换慢）
+ *   · 播放量高说明质量可信
+ */
+// [优化] 素材打分 v4
+//
+// 核心原则：**只有清唱能用**。
+//
+// 带伴奏的素材即使做分离，齿音和高频泛音也补不回来（人声和伴奏在那段频谱重叠），
+// 再走 RVC 就是二次损伤，成品发闷、糊、听不清词。所以伴奏版不是「次优」，
+// 而是「不能用」——打分上直接压到负分，让选材逻辑永远碰不到它。
+//
+// v4 修的坑：上次「雨爱 杨丞琳」选中了「尤克里里弹唱教学」14:09 ——
+// 「弹唱」被当成了清唱，但那是带吉他伴奏的教学视频，又长又吵。
+// 所以：弹唱单独区分，教学/tutorial 直接排除，超长一律不要。
+const VOCAL_ONLY_RE = /清唱|无伴奏|纯人声|干声|acapella|acappella|人声版|vocal\s*only/i;
+// 弹唱：有乐器伴奏，能用但不是最佳（比完整编曲好，比清唱差）
+const ACOUSTIC_RE = /弹唱|不插电|吉他伴奏|钢琴伴奏|自弹自唱/i;
+// 明确不能用的
+const INSTRUMENTAL_RE = /伴奏|纯音乐|instrumental|karaoke|KTV|去人声|消音/i;
+const TUTORIAL_RE = /教学|教程|tutorial|讲解|示范|如何|怎么唱|学唱|尤克里里|ukulele|吉他谱|鼓谱|谱/i;
+const FULL_SONG_RE = /hi-?res|无损|录音棚|动态歌词|歌词版|官方|MV|音乐视频|原版|原曲|完整版/i;
+
+function scoreItem(item) {
+  const t = item.title || '';
+  const dur = parseDuration(item.duration);
+  let score = 0;
+  const reasons = [];
+
+  const isVocalOnly = VOCAL_ONLY_RE.test(t);
+  const isAcoustic = ACOUSTIC_RE.test(t);
+  const isTutorial = TUTORIAL_RE.test(t);
+  const isInstrumental = INSTRUMENTAL_RE.test(t);
+  const isFullSong = FULL_SONG_RE.test(t);
+
+  // 教学/谱子类直接判死 —— 就算标题带「清唱」也不能用
+  if (isTutorial) {
+    score -= 300;
+    reasons.push('教学视频');
+  } else if (isInstrumental) {
+    score -= 200;
+    reasons.push('纯伴奏');
+  } else if (isVocalOnly) {
+    score += 100;                     // 清唱：唯一的正解
+    reasons.push('清唱');
+  } else if (isAcoustic) {
+    score += 20;                      // 弹唱：次优，能用但有伴奏
+    reasons.push('弹唱');
+  } else if (isFullSong) {
+    score -= 120;                     // 完整成品曲：带编曲，分离后音质差
+    reasons.push('带伴奏');
+  } else {
+    score -= 40;                      // 不确定：默认怀疑
+    reasons.push('未标明');
+  }
+
+  // 明显跑偏的内容
+  if (/dj|remix|串烧|合集|整张|专辑|循环|一小时|半小时|盘点|排行|reaction|直播回放/i.test(t)) {
+    score -= 80; reasons.push('内容不符');
+  }
+
+  // 时长：清唱才值得加分。超过 5 分钟的一律不要 ——
+  // 片段裁剪只需要 30 秒，但超长素材下载/转换都慢，而且多半是合集或现场。
+  if (isVocalOnly || isAcoustic) {
+    if (dur >= 45 && dur <= 180) { score += 40; reasons.push('时长理想'); }
+    else if (dur >= 30 && dur < 45) { score += 20; reasons.push('偏短'); }
+    else if (dur > 180 && dur <= 300) { score += 5; reasons.push('偏长'); }
+    else if (dur > 300) { score -= 80; reasons.push('过长'); }
+    else if (dur > 0 && dur < 30) { score -= 30; reasons.push('太短'); }
+  } else if (dur > 300) {
+    score -= 60; reasons.push('过长');
+  }
+
+  // 播放量（对数，避免大up主压倒一切）
+  const play = Number(item.play) || 0;
+  score += Math.min(15, Math.log10(play + 1) * 3);
+
+  // 只有清唱/弹唱才算「可用的演唱素材」
+  return { score, dur, reasons, isVocalOnly: (isVocalOnly || isAcoustic) && !isTutorial && !isInstrumental };
 }
 
 /** 搜索 B 站 */
@@ -73,7 +222,7 @@ export async function separateVocals(wavPath, tag) {
   //   1. pymss 默认往 ~/.cache 写模型，本机那个目录是软链、写不进去 → 内部用 model-dir
   //   2. 系统 PATH 没 ffmpeg → 脚本内自动加
   //   3. **显存不足时报的是误导性的 'utf-8 codec' 错误** → 内部 cuda 失败自动回退 cpu
-  const script = path.join(runtimePaths.rvcScriptsDir, 'separate_vocals.py');
+  const script = path.join(ROOT, '..', 'RVC', 'separate_vocals.py');
   if (!fs.existsSync(script)) {
     throw new Error(`找不到人声分离脚本: ${script}`);
   }
@@ -105,7 +254,7 @@ export async function separateVocals(wavPath, tag) {
  *   2. 确定 f0 变调量
  */
 export async function detectPitch(audioPath) {
-  const script = path.join(runtimePaths.rvcScriptsDir, 'detect_pitch.py');
+  const script = path.join(ROOT, '..', 'RVC', 'detect_pitch.py');
   if (!fs.existsSync(script)) {
     return { ok: false, error: 'detect_pitch.py 不存在' };
   }

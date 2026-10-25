@@ -2,8 +2,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { getRuntimePaths, readLocalConfig } from './core/runtime-config.mjs';
-import { runMediaProcess as run } from './core/media-process.mjs';
 
 // 唱歌模块：把一段歌声音频转成麻勒勒的音色，然后发到 QQ。
 //
@@ -21,14 +19,15 @@ import { runMediaProcess as run } from './core/media-process.mjs';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
 
-const runtimePaths = getRuntimePaths();
-const RVC_DIR = runtimePaths.rvcScriptsDir;
-const RVC_APP = runtimePaths.rvcDir;
-const RVC_OUT = runtimePaths.rvcOutputDir;
-const FFMPEG = runtimePaths.ffmpeg;
-const PYTHON = runtimePaths.rvcPython;
-const INFER_SCRIPT = runtimePaths.rvcInferScript;
-const VOICE_LIB = runtimePaths.voiceLibrary;
+const RVC_DIR = path.join(ROOT, '..', 'RVC');
+const RVC_APP = path.join(RVC_DIR, 'RVC20260718Nvidia50x0');
+const RVC_OUT = path.join(RVC_APP, 'output_malele');
+const FFMPEG = path.join(RVC_APP, 'ffmpeg.exe');
+const PYTHON = path.join(RVC_APP, 'runtime', 'python.exe');
+const INFER_SCRIPT = path.join(RVC_DIR, 'rvc_infer.py');
+
+// 桥接语音库（qq_send_voice 只认这个目录里的文件）
+const VOICE_LIB = path.join(ROOT, 'audio');
 
 /**
  * 杀掉整个进程树（Windows）。
@@ -47,12 +46,31 @@ const VOICE_LIB = runtimePaths.voiceLibrary;
 async function prepareGpu({ minFreeMB = 2200 } = {}) {
   const { spawn } = await import('node:child_process');
 
-  // The shared runner terminates only this request's owned child on timeout.
+  // 1. 清掉上一次的残留（rvc_infer / separate_vocals 不该常驻）
+  await new Promise((resolve) => {
+    const p = spawn('powershell', ['-NoProfile', '-Command',
+      "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | " +
+      "Where-Object { $_.CommandLine -match 'rvc_infer|separate_vocals' } | " +
+      'ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }',
+    ], { windowsHide: true, stdio: 'ignore' });
+    p.on('close', () => resolve());
+    p.on('error', () => resolve());
+  });
+
+  await new Promise((r) => setTimeout(r, 1500));
+
   // 2. 查空闲显存（抽成函数，因为可能要查两次）
   const readFree = async () => {
     try {
-      const probe = await run('nvidia-smi', ['--query-gpu=memory.free','--format=csv,noheader,nounits'], {timeoutMs:10000,maxOutputBytes:65536});
-      const out = probe.stdout;
+      const out = await new Promise((resolve) => {
+        const p = spawn('nvidia-smi', [
+          '--query-gpu=memory.free', '--format=csv,noheader,nounits',
+        ], { windowsHide: true });
+        let buf = '';
+        p.stdout.on('data', (d) => { buf += d.toString(); });
+        p.on('close', () => resolve(buf));
+        p.on('error', () => resolve(''));
+      });
       const n = parseInt(String(out).trim().split('\n')[0], 10);
       return Number.isFinite(n) ? n : null;
     } catch {
@@ -85,19 +103,92 @@ async function prepareGpu({ minFreeMB = 2200 } = {}) {
  * 只释放模型缓存，不杀进程，之后 ComfyUI 还能继续用。
  */
 async function tryFreeComfy() {
-  try {
-    const config=readLocalConfig();
-    const base=String(process.env.COMFYUI_URL || config.comfyui?.baseUrl || 'http://127.0.0.1:8188').replace(/\/+$/, '');
-    const response=await fetch(base+'/free',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({unload_models:true,free_memory:true}),signal:AbortSignal.timeout(15000)});
-    return {ok:response.ok,reason:response.ok?'':`ComfyUI HTTP ${response.status}`};
-  } catch { return {ok:false,reason:'ComfyUI is unavailable or timed out'}; }
+  const { spawn } = await import('node:child_process');
+  return new Promise((resolve) => {
+    const probe = spawn('powershell', [
+      '-NoProfile', '-Command',
+      '(Test-NetConnection 127.0.0.1 -Port 8188 -InformationLevel Quiet -WarningAction SilentlyContinue).ToString()',
+    ], { windowsHide: true });
+
+    let out = '';
+    probe.stdout.on('data', (d) => { out += d.toString(); });
+    probe.on('close', async () => {
+      if (!out.includes('True')) { resolve({ ok: false, reason: 'ComfyUI 未运行' }); return; }
+      try {
+        const res = await fetch('http://127.0.0.1:8188/free', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ unload_models: true, free_memory: true }),
+          signal: AbortSignal.timeout(15000),
+        });
+        await new Promise((r) => setTimeout(r, 2500));
+        resolve({ ok: res.ok });
+      } catch (e) {
+        resolve({ ok: false, reason: String(e?.message ?? e) });
+      }
+    });
+    probe.on('error', () => resolve({ ok: false, reason: 'probe 失败' }));
+  });
 }
 
-/** Compatibility: never sweep unrelated Python processes. */
-export async function killStalePython() { return { skipped: true }; }
+function killTree(pid) {
+  if (!pid) return;
+  try {
+    // taskkill /T 连子进程一起杀，/F 强制
+    spawn('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+  } catch {
+    try { process.kill(pid, 'SIGKILL'); } catch {}
+  }
+}
+
+/**
+ * 收工前清掉上一次中断留下的僵尸 Python 进程。
+ * 它们不会自己退出，会一直占着显存。
+ */
+export function killStalePython(pattern) {
+  try {
+    const { execSync } = require('node:child_process');
+  } catch {}
+  // 用 wmic 查（不引依赖）
+  return new Promise((resolve) => {
+    const p = spawn('powershell', [
+      '-NoProfile', '-Command',
+      `Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object { $_.CommandLine -like '*${pattern}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`,
+    ], { windowsHide: true, stdio: 'ignore' });
+    p.on('close', () => resolve());
+    p.on('error', () => resolve());
+  });
+}
 
 function log(...a) {
   console.error('[sing]', ...a);
+}
+
+/** 跑一个子进程，返回 {code, stdout, stderr} */
+function run(cmd, args, { env = {}, timeoutMs = 900000 } = {}) {
+  return new Promise((resolve) => {
+    const p = spawn(cmd, args, {
+      env: { ...process.env, ...env },
+      windowsHide: true,
+    });
+    let out = '';
+    let err = '';
+    const timer = setTimeout(() => {
+      try { killTree(p.pid); } catch {}
+      resolve({ code: -1, stdout: out, stderr: err + '\n[超时被杀]' });
+    }, timeoutMs);
+
+    p.stdout.on('data', (d) => { out += d.toString(); });
+    p.stderr.on('data', (d) => { err += d.toString(); });
+    p.on('close', (code) => {
+      clearTimeout(timer);
+      resolve({ code: code ?? -1, stdout: out, stderr: err });
+    });
+    p.on('error', (e) => {
+      clearTimeout(timer);
+      resolve({ code: -1, stdout: out, stderr: String(e?.message ?? e) });
+    });
+  });
 }
 
 /**
@@ -280,8 +371,6 @@ async function normalizeToMp3(wavPath, tag) {
  * 返回 { file（语音库文件名）, seconds, detail }
  */
 export async function renderSing(inputPath, { f0 = 0, clipSec = 30, clipStart = 8 } = {}) {
-  if (!fs.existsSync(inputPath)) throw new Error('Singing input audio does not exist.');
-  if (!fs.existsSync(INFER_SCRIPT) || !fs.existsSync(PYTHON)) throw new Error('Optional RVC adapter is missing. Configure paths.rvcInferScript and paths.rvcPython.');
   // 前置：清残留 + 查显存。不够就直接说明，别默默降到 CPU 跑十分钟
   const gpu = await prepareGpu({ minFreeMB: 2200 });
   if (gpu.freeMB !== null && !gpu.enough) {

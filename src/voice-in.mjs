@@ -1,7 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { PROJECT_ROOT, getRuntimePaths } from './core/runtime-config.mjs';
 
 // 让 AI「听见」语音消息：收到 record 段时，自动下载 + 转写成文字。
 //
@@ -17,9 +16,14 @@ import { PROJECT_ROOT, getRuntimePaths } from './core/runtime-config.mjs';
 // 为什么用 FunASR 而不是在线 ASR：本地、免费、中文准确率高，
 // 而且之前验证过（转抖音视频口播那套）。
 
-const ROOT = PROJECT_ROOT;
-const TRANSCRIBE_SCRIPT = getRuntimePaths().asrScript;
-const PYTHON = getRuntimePaths().asrPython;
+const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..');
+// ASR 脚本：优先环境变量，其次仓库内 src/douyin/
+// ASR 脚本：优先环境变量，其次仓库内的 src/douyin/douyin_transcribe.py
+const HERE = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
+const TRANSCRIBE_SCRIPT = process.env.ASR_SCRIPT || path.join(HERE, 'douyin', 'douyin_transcribe.py');
+
+// Python 解释器：需要装 FunASR。优先环境变量，否则用系统 python。
+const PYTHON = process.env.ASR_PYTHON || process.env.TTS_PYTHON || 'python';
 const TEMP_DIR = path.join(ROOT, 'state', 'voice-in');
 
 function log(...a) {
