@@ -68,37 +68,128 @@ async def search_bili(keyword, limit=10):
     return items
 
 
-def download_audio(bvid, out_dir=OUT_DIR):
-    """用 yt-dlp 只下音频，转成 wav。"""
-    os.makedirs(out_dir, exist_ok=True)
-    url = f"https://www.bilibili.com/video/{bvid}"
-    tpl = os.path.join(out_dir, f"{bvid}.%(ext)s")
+def _load_credential():
+    """读 bili-duty 的登录凭证。
 
-    cmd = [
-        YTDLP,
-        "--no-warnings",
-        "-f", "bestaudio/best",
-        "-x", "--audio-format", "wav",
-        "--audio-quality", "0",
-        "--ffmpeg-location", RVC_FFMPEG,
-        "-o", tpl,
-        "--no-playlist",
-        url,
+    2026-10 起 B 站对无凭证请求大量返回 412 风控页，带 sessdata+buvid3 才能稳定拿到流地址。
+    凭证缺失不算致命：降级为匿名请求，让上层看到明确错误而不是静默失败。
+    """
+    from bilibili_api import Credential
+    cands = [
+        os.environ.get("BILI_CREDENTIAL"),
+        os.path.join(os.environ.get("APPDATA", ""), "dsh-desktop", "harness", "bili-duty", "bili_credential.json"),
+        os.path.join(PROJECT_ROOT, "state", "bili_credential.json"),
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
-                       env={**os.environ, "PYTHONUTF8": "1"})
+    for p in cands:
+        if not p or not os.path.exists(p):
+            continue
+        try:
+            d = json.load(open(p, encoding="utf-8"))
+            cred = Credential(
+                sessdata=d.get("sessdata") or None,
+                bili_jct=d.get("bili_jct") or None,
+                buvid3=d.get("buvid3") or None,
+                dedeuserid=d.get("dedeuserid") or None,
+            )
+            if cred.has_sessdata():
+                return cred
+        except Exception:
+            continue
+    return None
 
-    wav = os.path.join(out_dir, f"{bvid}.wav")
-    if os.path.exists(wav):
-        return {"ok": True, "path": wav, "size_mb": round(os.path.getsize(wav) / 1024 / 1024, 1)}
 
-    # 有些情况会留下其他扩展名
-    for f in os.listdir(out_dir):
-        if f.startswith(bvid) and f.endswith((".wav", ".m4a", ".mp3", ".webm")):
-            p = os.path.join(out_dir, f)
-            return {"ok": True, "path": p, "size_mb": round(os.path.getsize(p) / 1024 / 1024, 1)}
+def download_audio(bvid, out_dir=OUT_DIR):
+    """下载音频并转成 wav。
 
-    return {"ok": False, "error": (r.stderr or r.stdout or "")[-500:]}
+    走 B 站官方 API 直链，**不再经过 yt-dlp**。
+    原因：yt-dlp 2026.10.21（当前最新稳定版）解析 B 站页面时报
+    `Unable to extract initial state` —— B 站改了前端结构，上游还没修。
+    官方 API 这条路更稳：拿到 dash.audio 直链后自己下 m4s，再 ffmpeg 转 wav。
+
+    取流优先级：dash.audio 最高码率 > dash.flac > durl（老视频没有 dash）。
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    wav_path = os.path.join(out_dir, f"{bvid}.wav")
+
+    try:
+        import asyncio
+        from bilibili_api import video
+    except Exception as e:
+        return {"ok": False, "error": f"bilibili_api 不可用: {type(e).__name__}: {e}"}
+
+    async def _fetch():
+        cred = _load_credential()
+        v = video.Video(bvid=bvid, credential=cred) if cred else video.Video(bvid=bvid)
+        info = await v.get_info()
+        cid = (info.get("pages") or [{}])[0].get("cid") or info.get("cid")
+        data = await v.get_download_url(cid=cid)
+        return info, data
+
+    try:
+        info, data = asyncio.run(_fetch())
+    except Exception as e:
+        return {"ok": False, "error": f"取流失败 {type(e).__name__}: {str(e)[:300]}"}
+
+    dash = data.get("dash") or {}
+    candidates = []
+    for a in (dash.get("audio") or []):
+        u = a.get("baseUrl") or a.get("base_url") or ""
+        if u:
+            candidates.append((a.get("bandwidth") or 0, u))
+    flac = (dash.get("flac") or {}).get("audio")
+    if flac:
+        u = flac.get("baseUrl") or flac.get("base_url") or ""
+        if u:
+            candidates.append((10 ** 9, u))   # flac 优先
+    if not candidates:
+        for d in (data.get("durl") or []):
+            u = d.get("url") or ""
+            if u:
+                candidates.append((0, u))
+    if not candidates:
+        return {"ok": False, "error": "API 未返回任何音频流（可能需要登录凭证或视频受限）"}
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    url = candidates[0][1]
+
+    # 直链需要 Referer，否则 403
+    raw = os.path.join(out_dir, f"{bvid}.m4s")
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Referer": f"https://www.bilibili.com/video/{bvid}",
+            "Origin": "https://www.bilibili.com",
+        })
+        with urllib.request.urlopen(req, timeout=180) as resp, open(raw, "wb") as f:
+            while True:
+                chunk = resp.read(256 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+    except Exception as e:
+        return {"ok": False, "error": f"下载失败 {type(e).__name__}: {str(e)[:300]}"}
+
+    if not os.path.exists(raw) or os.path.getsize(raw) < 1024:
+        return {"ok": False, "error": "下载到的文件为空"}
+
+    # m4s → wav
+    ff = RVC_FFMPEG if os.path.exists(RVC_FFMPEG) else "ffmpeg"
+    cmd = [ff, "-y", "-loglevel", "error", "-i", raw, "-vn",
+           "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "1", wav_path]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if os.path.exists(wav_path) and os.path.getsize(wav_path) > 1024:
+        try:
+            os.remove(raw)
+        except Exception:
+            pass
+        return {"ok": True, "path": wav_path,
+                "size_mb": round(os.path.getsize(wav_path) / 1024 / 1024, 1),
+                "title": info.get("title")}
+
+    return {"ok": False, "error": f"ffmpeg 转码失败: {(r.stderr or '')[-300:]}"}
+
 
 
 def main():

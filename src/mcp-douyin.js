@@ -482,14 +482,22 @@ server.tool(
 
 server.tool(
   'douyin_read_im',
-  '打开一个抖音私信会话，读出里面的消息；如果对方发过视频分享，会一并解析出视频内容。'
-  + '别人在抖音里分享给你视频、你想知道那是什么时用它。',
+  '打开一个抖音私信会话，读出里面的消息；对方分享的视频会真的下载并转成文字（听懂内容）。'
+  + '别人在抖音里分享视频给你、你想知道「里面说了什么」时用它 —— 只给标题不算看懂。',
   {
     to: z.string().min(1).describe('会话对方昵称（模糊匹配）'),
     limit: z.number().int().min(5).max(60).optional().describe('读最近多少条，默认 20'),
     with_video: z.boolean().optional().describe('是否解析里面的视频链接，默认 true'),
+    transcribe: z.boolean().optional()
+      .describe('是否把分享的视频转成文字（默认 true）。关掉只拿标题和评论，快但看不懂内容'),
+    max_videos: z.number().int().min(1).max(5).optional()
+      .describe('最多转写几条视频，默认 2。转写较慢（30 秒视频约 10-20 秒），别一次开太多'),
   },
-  async ({ to, limit, with_video }) => {
+  async ({ to, limit, with_video, transcribe, max_videos }) => {
+    const PY = process.env.TTS_PYTHON || path.resolve(ROOT, '..', '..', 'GPT-SoVITS', 'GPT-SoVITS-v2pro-20250604-nvidia50', 'runtime', 'python.exe');
+    const ASR = path.join(DY_DIR, 'douyin_transcribe.py');
+    const MEDIA_DIR = path.join(DY_DIR, 'media');
+
     const res = await withReader(async (reader, b) => {
       const { pathToFileURL } = await import('node:url');
       const mod = await import(pathToFileURL(path.join(DY_DIR, 'douyin-im.mjs')).href);
@@ -497,6 +505,13 @@ server.tool(
       return im.readSharedFrom(String(to), {
         limit: limit ?? 20,
         reader: with_video === false ? null : reader,
+        // 显式关掉才不转写；默认要真听懂（不然只能拿到标题）
+        transcribe: (with_video === false || transcribe === false) ? null : {
+          py: PY,
+          asrScript: ASR,
+          mediaDir: MEDIA_DIR,
+          maxVideos: max_videos ?? 2,
+        },
       });
     });
     if (!res.ok) {
@@ -523,6 +538,11 @@ server.tool(
         const sender = v.from === 'me' ? '机器人自己发的' : v.from === 'them' ? '对方分享的' : '来源不明';
         parts.push(`【${sender}】`);
         parts.push(v.text);
+        if (v.transcribe_ok && v.transcript) {
+          parts.push(`【视频里说的】${v.transcript}`);
+        } else if (v.transcribe_error) {
+          parts.push(`【转写失败】${v.transcribe_error}`);
+        }
         parts.push('');
       }
       // 如果所有的分享都来自对方，加一句提示，避免 AI 误以为是自己的

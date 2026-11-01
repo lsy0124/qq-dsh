@@ -269,7 +269,14 @@ export class DouyinIM {
    * 打开会话 → 读消息 → 把里面的抖音链接解析成视频详情。
    * 这是「别人在抖音私信里给我分享视频」的正确处理路径。
    */
-  async readSharedFrom(nameHint, { limit = 20, reader = null } = {}) {
+  /**
+   * 读会话 + 解析里边的视频分享。
+   *
+   * transcribe 传入 { asr, mediaDir, py, asrScript, maxVideos } 时，
+   * 会把分享的视频真的下载下来转成文字（否则只能拿到标题/评论，
+   * 用户问「视频里说了什么」就答不出，只能说「只有标题」）。
+   */
+  async readSharedFrom(nameHint, { limit = 20, reader = null, transcribe = null } = {}) {
     await this.openPanel();
     const { conversation } = await this.openConversation(nameHint);
     await new Promise((r) => setTimeout(r, 2500));
@@ -288,6 +295,55 @@ export class DouyinIM {
             }
           } catch {}
         }
+      }
+    }
+
+    // 真正听懂视频：下载 → 抽音轨 → 转写。只处理最近的几条，避免一次五个视频跑十分钟。
+    if (transcribe && videos.length) {
+      const { spawnSync } = await import('node:child_process');
+      const { pathToFileURL } = await import('node:url');
+      const fsMod = await import('node:fs');
+      const pathMod = await import('node:path');
+      const mediaUrl = pathToFileURL(pathMod.resolve(
+        pathMod.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')),
+        'douyin-media.mjs')).href;
+
+      const maxVideos = Math.max(1, Number(transcribe.maxVideos) || 2);
+      const targets = videos.slice(-maxVideos);
+
+      try {
+        const { DouyinMedia } = await import(mediaUrl);
+        const media = new DouyinMedia(this.page);
+        fsMod.mkdirSync(transcribe.mediaDir, { recursive: true });
+
+        for (const v of targets) {
+          try {
+            v.transcribe_ok = false;
+            const dl = await media.download(String(v.aweme_id), transcribe.mediaDir);
+            const r = spawnSync(transcribe.py, [transcribe.asrScript, dl.file], {
+              encoding: 'utf8',
+              timeout: 300000,
+              env: { ...process.env, PYTHONUTF8: '1' },
+            });
+            const out = (r.stdout || '').trim();
+            const m2 = out.match(/\{[\s\S]*\}/);
+            if (m2) {
+              const j = JSON.parse(m2[0]);
+              if (j.ok && j.text) {
+                v.transcript = String(j.text).trim();
+                v.transcribe_ok = true;
+              } else {
+                v.transcribe_error = j.error || '转写无结果';
+              }
+            } else {
+              v.transcribe_error = (r.stderr || out || '转写脚本无输出').slice(-200);
+            }
+          } catch (e) {
+            v.transcribe_error = String(e?.message ?? e).slice(0, 200);
+          }
+        }
+      } catch (e) {
+        for (const v of targets) v.transcribe_error = `媒体模块加载失败: ${String(e?.message ?? e).slice(0, 120)}`;
       }
     }
 

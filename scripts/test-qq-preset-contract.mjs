@@ -14,13 +14,17 @@ const prefix = persona?.config?.prefix ?? '';
 test('reserved2 YAML resolves to the expected persona and template variables', () => {
   assert.equal(persona?.name, '@deepseek-ai/dsh-persona');
   assert.match(prefix, /\{\{model\}\}/);
-  assert.doesNotMatch(persona.config.suffix, /\{\{cwd\}\}/);
+  // 0.1.5 起 dsh-persona 用 prefix/suffix，{{model}} / {{cwd}} 都由 agent loop
+  // 注册的变量在装配时解析 —— suffix 里保留 {{cwd}} 是有意的（见文件头注释），
+  // 断言它「存在且能被解析」，而不是断言它消失。
+  assert.match(persona.config.suffix, /\{\{cwd\}\}/);
   assert.equal(Object.hasOwn(persona.config, 'text'), false);
 });
 
 test('local/admin tool restrictions and existing compaction budgets stay intact', () => {
   assert.deepEqual(preset.map((row) => row.id), [
-    'persona', 'tool-web', 'mcp-douyin', 'mcp-voice-say', 'mcp-comfyui', 'tool-ask-user', 'tool-todo', 'qq-tool-restrict', 'compaction',
+    'persona', 'tool-web', 'mcp-douyin', 'mcp-voice-say', 'mcp-comfyui', 'mcp-stardew-ai', 'mcp-pvz',
+    'tool-ask-user', 'tool-todo', 'qq-tool-restrict', 'compaction',
   ]);
   assert.deepEqual(preset.find((row) => row.id === 'tool-web').config, { search: false, fetch: false });
   assert.equal(preset.find((row) => row.id === 'qq-tool-restrict').name, './qq-tool-restrict.mjs');
@@ -68,7 +72,7 @@ test('pre-reply quiet checks, waiting for replies and pre-sleep observation have
 test('social autonomy and visual, forwarding, sticker and web capabilities remain described', () => {
   for (const text of [
     '【反 AI 味：拒绝有求必应】', '【保持主体性】', '【学习群友策略】',
-    '【不要当群管家/主持人】', '普通对话默认 1 条，最多 2 条', '不要用空格断句',
+    '【不要当群管家/主持人】', '一条=一个意群，条数不设上限', '不要用空格断句',
     '不会自动发送到 QQ', 'qq_get_message_images', 'qq_get_forward_msg', 'nestedForwardIds',
     'qq_send_poke', 'qq_list_stickers', 'qq_get_sticker_image', 'qq_send_sticker',
     'qq_collect_sticker', 'qq_sticker_note', 'qq_get_self_image',
@@ -90,8 +94,9 @@ test('autonomy limits and the observation escape hatch stay described', () => {
     '【记忆卫生】', 'qq_memory_append', 'qq_memory_query', 'qq_memory_remove', 'qq_memory_clear',
     // 黑话面
     'qq_slang_query', 'qq_slang_submit', '不重复提交',
-    // 频率上限
-    '普通闲聊约 3~5 轮一张', '别刷屏', '每条只能一张，不能附带文字', '不要频繁拍',
+    // 频率上限（表情包节奏放宽到「1~2 轮一张，情绪上来可以连着用」——
+    // 原来钉的是 3~5 轮一张 + 别刷屏，和现在的措辞不一致）
+    '普通闲聊约 1~2 轮一张', '每条只能一张，不能附带文字', '不要频繁拍',
     // 会话令牌是硬前置，漏传会被拒绝。
     '作为 token 参数传入',
     // 指定成员唤醒

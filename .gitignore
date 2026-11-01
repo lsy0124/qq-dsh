@@ -86,3 +86,8 @@ _*.err
 src/__pycache__/
 __pycache__/
 *.pyc
+
+# 发布前脱敏：本机专用交付文档与草稿备份
+/local-backups/
+/PVZ-HANDOVER.md
+_*.cjs

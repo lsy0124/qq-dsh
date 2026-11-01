@@ -200,14 +200,49 @@ export async function searchSongs(keyword) {
   return ranked;
 }
 
-/** 下载某个 BV */
-export async function downloadSong(bvid) {
-  const r = await run(BILI_PY, [SEARCH_SCRIPT, 'download', bvid], { timeoutMs: 600000 });
-  const line = (r.stdout || '').split('\n').filter((l) => l.trim().startsWith('{')).pop();
-  if (!line) throw new Error(`下载失败：${(r.stderr || '').slice(-300)}`);
-  const data = JSON.parse(line);
-  if (!data.ok) throw new Error(`下载失败：${data.error}`);
-  return data;
+/**
+ * 下载某个 BV。
+ *
+ * 带重试：B 站会对连续请求做短时限流，返回 `HTTP 567`。
+ * 实测两次请求同一视频：第 1 次 567，第 2 次成功 —— 所以这不是「视频坏了」，
+ * 等一两秒重试就能过。不重试的话，偶发 567 会被误判成「素材下不来」。
+ */
+export async function downloadSong(bvid, { attempts = 4 } = {}) {
+  let lastErr = null;
+
+  for (let i = 1; i <= attempts; i++) {
+    const r = await run(BILI_PY, [SEARCH_SCRIPT, 'download', bvid], { timeoutMs: 600000 });
+    const line = (r.stdout || '').split('\n').filter((l) => l.trim().startsWith('{')).pop();
+    if (!line) {
+      lastErr = new Error(`下载失败：${(r.stderr || '').slice(-300)}`);
+      // 无输出多半是硬失败，不重试
+      throw lastErr;
+    }
+
+    let data;
+    try {
+      data = JSON.parse(line);
+    } catch {
+      throw new Error('下载输出无法解析');
+    }
+
+    if (data.ok) return data;
+
+    lastErr = new Error(`下载失败：${data.error}`);
+    const msg = String(data.error || '');
+
+    // 只有限流类错误值得重试；视频不存在（-404 / 啥都木有）重试也没用
+    const retryable = /56[0-9]|429|限流|too many|稍后/.test(msg);
+    if (!retryable || i === attempts) break;
+
+    // 退避要够长：实测连着请求会被 567 挡住，等 20 秒才恢复。
+    // 1.5s/3s 那种短退避不起作用（实测 3 次全失败），起步给 8 秒。
+    const waitMs = 8000 * i;
+    log(`  ↻ ${bvid} 被限流（第 ${i} 次），${waitMs / 1000}s 后重试`);
+    await new Promise((res) => setTimeout(res, waitMs));
+  }
+
+  throw lastErr ?? new Error('下载失败');
 }
 
 /**
@@ -217,6 +252,31 @@ export async function downloadSong(bvid) {
 export async function separateVocals(wavPath, tag) {
   const outDir = path.join(DOWNLOAD_DIR, `stem_${tag}`);
   fs.mkdirSync(outDir, { recursive: true });
+
+  // ── 缓存：同一首歌的人声分离结果直接复用 ──
+  //
+  // 为什么要缓存（2026-10-29 实测）：
+  //   人声分离在 CPU 上要 5.6 分钟（GPU 显存不够时会回退）。
+  //   同一首歌被点第二次、或者换了 clip_start 重唱，没理由再等一遍。
+  //   缓存按「wav 路径 + tag」定位，文件存在且非空就直接返回。
+  // 注意目录结构：separate_vocals.py 会在 outDir 下再建一层同名子目录，
+  // 实际产物是 stem_<tag>/<tag>/<tag>_Vocals.wav（2026-10-29 实测）。
+  // 两个位置都查，兼容脚本将来改行为。
+  const cacheCandidates = [
+    path.join(outDir, tag, `${tag}_Vocals.wav`),
+    path.join(outDir, `${tag}_Vocals.wav`),
+  ];
+  for (const cached of cacheCandidates) {
+    try {
+      if (fs.existsSync(cached)) {
+        const st = fs.statSync(cached);
+        if (st.size > 100 * 1024) {
+          log(`人声分离命中缓存（${(st.size / 1024 / 1024).toFixed(1)}MB），跳过`);
+          return cached;
+        }
+      }
+    } catch {}
+  }
 
   // 走 RVC 目录下的封装脚本 —— 它处理了三个坑：
   //   1. pymss 默认往 ~/.cache 写模型，本机那个目录是软链、写不进去 → 内部用 model-dir
@@ -390,10 +450,65 @@ export async function fetchSongAudio(songName, { preferVocalOnly = true } = {}) 
 
   log('选中:', target.title, '|', target.duration, '| 分数', Math.round(target.score));
 
-  log('下载…');
-  const dl = await downloadSong(target.bvid);
+  // ── 下载：按优先级依次试，第一个成功的就用 ──
+  //
+  // 为什么不能只试一个（2026-10-29 实测）：
+  //   她点《不舍》，选中 BV1PB1iBKEeZ → B 站返回 `-404 啥都木有`（视频被删/限流）
+  //   程序直接抛错。但同一批候选里另外两条 2-3 秒就下完了。
+  //   还有更糟的：坏视频不报错而是卡住，一路等到 5 分钟超时，她只能回「下载超时」。
+  //
+  // 策略：把「清唱 + 时长合理」的候选按分数排好，逐个试。
+  //   明确的取流错误 → 立刻换（不浪费时间）
+  //   超时 → 也换（但要防止每条都等满，所以最多试 3 条）
+  const candidates = (() => {
+    if (!preferVocalOnly) return [target];
+    const usable = results
+      .filter((r) => r.isVocalOnly && r.dur >= 15 && r.dur <= 300)
+      .sort((a, b) => b.score - a.score);
+    // target 排最前，其余按分数
+    const rest = usable.filter((r) => r.bvid !== target.bvid);
+    return [target, ...rest].slice(0, 3);
+  })();
+
+  log(`候选 ${candidates.length} 条，依次尝试…`);
+
+  let dl = null;
+  let usedTarget = target;
+  const failed = [];
+
+  for (const cand of candidates) {
+    try {
+      log(`  试 ${cand.bvid}（${cand.title.slice(0, 30)}…）`);
+      const r = await downloadSong(cand.bvid);
+      dl = r;
+      usedTarget = cand;
+      if (cand.bvid !== target.bvid) log(`  换用 ${cand.bvid} 成功`);
+      break;
+    } catch (e) {
+      const msg = String(e?.message ?? e);
+      failed.push(`${cand.bvid}: ${msg.slice(0, 60)}`);
+      log(`  ✗ ${cand.bvid} 失败：${msg.slice(0, 80)}`);
+      // 超时类不再重试（避免整体拖到几分钟）
+      if (/timed out|timeout|超时/i.test(msg)) {
+        log('  超时，停止继续尝试');
+        break;
+      }
+    }
+  }
+
+  if (!dl) {
+    throw new Error(
+      `这几条素材都下不下来：\n${failed.map((x) => '· ' + x).join('\n')}`
+      + `\n换个说法再搜（比如只留歌名），或者换一首歌。`,
+    );
+  }
+
   let audioPath = dl.path;
   let separated = false;
+  // 后面用到的是「实际下载成功的那条」，不是最初选中的
+  if (usedTarget !== target) {
+    target = usedTarget;
+  }
 
   // 不是清唱 → 分离人声
   if (!target.hasVocalOnly) {

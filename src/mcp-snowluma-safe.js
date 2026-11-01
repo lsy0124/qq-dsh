@@ -328,6 +328,10 @@ const TOOL_CONFIG_FLAGS = {
   qq_memory_query: 'memory',
   qq_memory_remove: 'memory',
   qq_memory_clear: 'memory',
+  qq_memory_search: 'memory',
+  qq_memory_read: 'memory',
+  qq_memory_record: 'memory',
+  qq_list_saved_images: 'getImages',
   qq_slang_query: 'slangQuery',
   qq_slang_submit: 'slangSubmit',
   qq_send_voice: 'sendVoice',
@@ -868,29 +872,69 @@ server.tool(
 // ── 说说（QQ 空间）───────────────────────────────────────────────────────────
 server.tool(
   'qq_post_qzone',
-  '发一条 QQ 空间说说。支持纯文字或文字+图片（图片传本机绝对路径，工具自动转 base64）。'
-  + '**默认只发给自己可见**（ugc_right=64），因为公开说说会推送给所有好友、且删不干净；'
-  + '确实想公开时再显式传 visibility。',
+  '发一条 QQ 空间说说。支持纯文字或文字+图片。'
+  + '**默认所有人可见**（ugc_right=1），像真的在运营自己的空间。'
+  + '想只给好友看传 visibility="friends"，只想自己留着传 visibility="self"。'
+  + '\n\n【配图怎么传】imagePaths 接受三种写法，任选：'
+  + '\n  1. 图片库里的相对路径（最常用）—— 先用 qq_list_saved_images 看一眼有哪些，'
+  + '然后直接把返回的 relPath 放进来，例如 "media/images/2026-10-31/f1f2adcec8e60102.jpg"。'
+  + '这些都是他或群里发过的图，我在收到时就存到本地了。'
+  + '\n  2. 本机绝对路径 —— 例如你刚用工具生成的图 "C:/xxx/output.png"。'
+  + '\n  3. 空着不传 —— 就是纯文字说说。'
+  + '\n\n【什么时候该配图】说说配图比纯文字更容易被点开。'
+  + '他发过好看的图、你们一起经历的那天的照片、自己生成的作品，都可以配。'
+  + '最多 9 张（凑九宫格更好看）。别硬凑，没有合适的就发纯文字。',
   {
     key: z.string().describe('会话 key（用于审计）'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
     content: z.string().min(1).max(1000).describe('说说正文'),
-      imagePaths: z.array(z.string()).max(9).optional().describe('配图路径数组，最多 9 张（QQ 空间上限）。想发九宫格就凑 9 张；别默认只传 1 张'),
+      imagePaths: z.array(z.string()).max(9).optional()
+        .describe('配图路径数组，最多 9 张。'
+          + '可以传 qq_list_saved_images 返回的 relPath（相对路径，如 media/images/2026-10-31/xxx.jpg），'
+          + '也可以传本机绝对路径。想发九宫格就凑 9 张；没有合适的图就别硬凑。'),
     visibility: z.enum(['self', 'friends', 'public']).optional()
-      .describe('可见范围：self=仅自己（默认）、friends=好友可见、public=所有人可见'),
+      .describe('可见范围：public=所有人可见（默认）、friends=好友可见、self=仅自己'),
   },
   async ({ key, token, content, imagePaths, visibility }) => {
     try {
       const fs = await import('node:fs');
       const map = { self: 64, friends: 4, public: 1 };
-      const ugc = map[visibility ?? 'self'] ?? 64;
+      const ugc = map[visibility ?? 'public'] ?? 1;
 
       let images;
       if (Array.isArray(imagePaths) && imagePaths.length) {
         images = [];
-        for (const p of imagePaths) {
+        const pathMod = await import('node:path');
+        // 本文件在 qq-bridge/src/ 下，图片库在 qq-bridge/state/media/images/
+        // 用模块顶部的 __dirname，别再算一次 import.meta —— 测试用 vm 加载本文件时
+        // vm 里没有 ESM 的 import.meta，重算会把整条工具链拖垮（qq_post_qzone 一调就抛）。
+        const stateDir = pathMod.resolve(__dirname, '..', 'state');
+
+        for (const raw of imagePaths) {
+          let p = String(raw).trim();
+          // 统一斜杠
+          p = p.replace(/\\/g, '/');
+          if (!pathMod.isAbsolute(p)) {
+            // 相对路径：优先在 state/ 下找（图片库就是 media/images/<日期>/<hash>.jpg）
+            p = pathMod.join(stateDir, p);
+          }
           if (!fs.existsSync(p)) {
-            return { content: [{ type: 'text', text: `图片不存在：${p}` }], isError: true };
+            // 再试：也许她传的是 "2026-10-31/xxx.jpg" 少了 media/images 前缀
+            const alt = pathMod.join(stateDir, 'media', 'images', String(raw).replace(/\\\\/g, '/'));
+            if (fs.existsSync(alt)) {
+              p = alt;
+            } else {
+              return {
+                content: [{
+                  type: 'text',
+                  text: `图片不存在：${raw}\n`
+                    + `（试过：${p}）\n`
+                    + `提示：传相对路径时要写完整，例如 media/images/2026-10-31/xxx.jpg。`
+                    + `不确定有哪些图，先调 qq_list_saved_images 看一眼。`,
+                }],
+                isError: true,
+              };
+            }
           }
           const buf = fs.readFileSync(p);
           images.push(`base64://${buf.toString('base64')}`);
@@ -904,7 +948,7 @@ server.tool(
       return {
         content: [{
           type: 'text',
-          text: JSON.stringify({ ok: true, tid: data?.tid ?? null, time: data?.time ?? null, visibility: visibility ?? 'self', key }, null, 2),
+          text: JSON.stringify({ ok: true, tid: data?.tid ?? null, time: data?.time ?? null, visibility: visibility ?? 'public', key }, null, 2),
         }],
       };
     } catch (error) {
@@ -1109,12 +1153,80 @@ server.tool(
 );
 
 server.tool(
+  'qq_friend_requests',
+  '查看待处理的好友申请（只读）。返回 uid（处理时当 flag 用）、QQ 号、昵称、来源、留言。'
+  + '有人加你但还没通过时，这里能看到。',
+  {
+    key: z.string().describe('会话 key（用于审计）'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+  },
+  async () => {
+    try {
+      const data = await onebot('get_doubt_friends_add_request', {});
+      const list = Array.isArray(data) ? data : (data?.data ?? []);
+      if (!list.length) {
+        return { content: [{ type: 'text', text: '没有待处理的好友申请。' }] };
+      }
+      const lines = [`共 ${list.length} 条待处理好友申请：`];
+      for (const it of list) {
+        const uid = it.uid ?? it.flag ?? '';
+        const qq = it.user_id ?? it.uin ?? '?';
+        const nick = it.nickname ?? it.nick ?? '(无昵称)';
+        const src = it.source ?? it.from ?? '';
+        const msg = it.message ?? it.msg ?? '';
+        lines.push(`· flag=${uid}  QQ=${qq}  昵称=${nick}${src ? '  来源=' + src : ''}${msg ? '  留言=' + msg : ''}`);
+      }
+      lines.push('', '用 qq_friend_accept(flag=...) 通过，或 qq_friend_reject(flag=...) 拒绝。');
+      return { content: [{ type: 'text', text: lines.join('\n') }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `读取好友申请失败：${error?.message ?? error}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  'qq_friend_accept',
+  '通过一条好友申请。flag 从 qq_friend_requests 拿。',
+  {
+    key: z.string().describe('会话 key（用于审计）'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    flag: z.string().min(1).describe('申请的 flag（qq_friend_requests 返回的 uid）'),
+  },
+  async ({ flag }) => {
+    try {
+      await onebot('set_friend_add_request', { flag: String(flag), approve: true });
+      return { content: [{ type: 'text', text: `已通过好友申请 ${flag}` }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `通过失败：${error?.message ?? error}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  'qq_friend_reject',
+  '拒绝一条好友申请。flag 从 qq_friend_requests 拿。',
+  {
+    key: z.string().describe('会话 key（用于审计）'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    flag: z.string().min(1).describe('申请的 flag'),
+  },
+  async ({ flag }) => {
+    try {
+      await onebot('set_friend_add_request', { flag: String(flag), approve: false });
+      return { content: [{ type: 'text', text: `已拒绝好友申请 ${flag}` }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `拒绝失败：${error?.message ?? error}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
   'qq_memory_append',
-  '记录一条轻量记忆：activeTopic=进行中的话题；pendingThought=你想说但还没说的话；memberImpression=对某位群友的印象。记忆会持久化，并在后续唤醒/qq_get_prompt 中自动出现。',
+  '记录一条轻量记忆：activeTopic=进行中的话题；pendingThought=你想说但还没说的话；memberImpression=对某位群友的印象；selfBelief=你对自己的看法（会随经历改变，这是性格变化的载体）；contentMemory=你刷到的好东西（抖音/B站/贴吧，只记真让你停下来的）。记忆会持久化，并在后续唤醒/qq_get_prompt 中自动出现。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-    category: z.enum(['activeTopic', 'pendingThought', 'memberImpression']).describe('记忆类别'),
+    category: z.enum(['activeTopic', 'pendingThought', 'memberImpression', 'selfBelief', 'contentMemory']).describe('记忆类别'),
     content: z.string().describe('记忆内容，例如话题、想说的话、对某人的印象标签'),
     extra: z.object({
       target: z.string().optional().describe('memberImpression 时的群友名字/昵称'),
@@ -1144,7 +1256,7 @@ server.tool(
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-    category: z.enum(['activeTopic', 'pendingThought', 'memberImpression']).optional().describe('可选：只看某一类记忆')
+    category: z.enum(['activeTopic', 'pendingThought', 'memberImpression', 'selfBelief', 'contentMemory']).optional().describe('可选：只看某一类记忆')
   },
   async ({ key, token, category }) => {
     try {
@@ -1159,12 +1271,114 @@ server.tool(
 );
 
 server.tool(
-  'qq_memory_remove',
-  '删除一条轻量记忆：activeTopic/pendingThought 用 content 匹配原文删除；memberImpression 用 target 参数指定群友名字删除。',
+  'qq_memory_search',
+  '【长期记忆】搜索很久以前的事。轻量记忆（qq_memory_query）只能看到最近几小时到几天；'
+  + '这里是**长期**的那一层——几个月前聊过的、答应过的、吵过的，都能搜到。'
+  + '什么时候用：他说"你还记得吗"、你想起来好像有这么回事但细节模糊、'
+  + '或者要确认某件事的来龙去脉。'
+  + '返回 L0 索引行（一句摘要 + id），要细节再用 qq_memory_read 展开。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-    category: z.enum(['activeTopic', 'pendingThought', 'memberImpression']).describe('记忆类别'),
+    query: z.string().min(1).describe('搜什么（关键词，别写整句）'),
+    limit: z.number().int().min(1).max(20).optional().describe('最多几条，默认 8'),
+  },
+  async ({ key, token, query, limit }) => {
+    try {
+      const data = await agentApi('/api/memory/search', {
+        method: 'POST',
+        body: JSON.stringify({ query, limit: limit || 8 }),
+        headers: { 'x-agent-token': token }
+      });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `长期记忆搜索失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_memory_read',
+  '【长期记忆】展开某一条的完整内容。先 qq_memory_search 拿到 id，再用这个看细节。'
+  + '别一次展开很多条——想起来哪条才展开哪条。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    id: z.string().min(1).describe('记忆 id（qq_memory_search 返回的 id）'),
+  },
+  async ({ key, token, id }) => {
+    try {
+      const data = await agentApi('/api/memory/read', {
+        method: 'POST',
+        body: JSON.stringify({ id }),
+        headers: { 'x-agent-token': token }
+      });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `展开记忆失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_memory_record',
+  '【长期记忆】手动记一条值得长期留的事。'
+  + '日常闲聊不用记（系统会自动提炼）；这个工具是给**重要的事**用的：'
+  + '郑重的约定、他提到的重要信息、你们之间的转折、你自己的想法变了。'
+  + 'abstract 要写成「半年后陌生人也能看懂、也能搜到」的一句话。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    kind: z.enum(['episode', 'fact-yg', 'fact-us', 'fact-self'])
+      .describe('episode=发生的事；fact-yg=关于他的事实；fact-us=关于你们俩的约定/纪念；fact-self=关于你自己的变化'),
+    abstract: z.string().min(4).max(200).describe('一句话摘要（半年后要能搜到）'),
+    body: z.string().optional().describe('可选的正文细节（markdown）'),
+    weight: z.number().int().min(1).max(10).optional().describe('重要性 1-10，默认 5；9-10 是人生转折/郑重承诺'),
+    supersedes: z.string().optional().describe('要取代的旧记忆 id（旧的不删，但不再参与召回）'),
+  },
+  async ({ key, token, kind, abstract, body, weight, supersedes }) => {
+    try {
+      const data = await agentApi('/api/memory/record', {
+        method: 'POST',
+        body: JSON.stringify({ kind, abstract, body: body || '', weight: weight || 5, supersedes: supersedes || '' }),
+        headers: { 'x-agent-token': token }
+      });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `记录失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_list_saved_images',
+  '【图片库】列出他/群里发过的、已经存到本地的图片。'
+  + 'QQ 的图片链接会过期，但你已经存下来了 —— 想翻旧图时用这个。'
+  + '返回每张图的路径和时间。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    limit: z.number().int().min(1).max(100).optional().describe('最多几张，默认 30'),
+  },
+  async ({ key, token, limit }) => {
+    try {
+      const data = await agentApi(`/api/media/list?limit=${limit || 30}`, {
+        headers: { 'x-agent-token': token }
+      });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `读取图片库失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_memory_remove',
+  '删除一条轻量记忆：activeTopic/pendingThought 用 content 匹配原文删除；memberImpression 用 target 参数指定群友名字删除；selfBelief/contentMemory 用 content 匹配。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    category: z.enum(['activeTopic', 'pendingThought', 'memberImpression', 'selfBelief', 'contentMemory']).describe('记忆类别'),
     content: z.string().optional().describe('要删除的话题/想法原文（memberImpression 不需要）'),
     target: z.string().optional().describe('memberImpression 时要删除的群友名字')
   },
@@ -1184,11 +1398,11 @@ server.tool(
 
 server.tool(
   'qq_memory_clear',
-  '清空轻量记忆：不传 category 清空全部；传 activeTopic/pendingThought/memberImpression 只清空对应类别。',
+  '清空轻量记忆：不传 category 清空全部；传 activeTopic/pendingThought/memberImpression/selfBelief/contentMemory 只清空对应类别。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-    category: z.enum(['activeTopic', 'pendingThought', 'memberImpression']).optional().describe('要清空的类别，缺省清空全部')
+    category: z.enum(['activeTopic', 'pendingThought', 'memberImpression', 'selfBelief', 'contentMemory']).optional().describe('要清空的类别，缺省清空全部')
   },
   async ({ key, token, category }) => {
     try {

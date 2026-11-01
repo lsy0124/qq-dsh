@@ -17,5 +17,10 @@ test('Douyin MCP starts without its external adapter and rejects disabled writes
   assert.ok(tools.some(tool=>tool.name==='douyin_send_message'));
   assert.ok(tools.some(tool=>tool.name==='douyin_status'));
   const result=await client.callTool({name:'douyin_send_message',arguments:{to:'fixture',text:'fixture-only'}});
-  assert.equal(result.isError,true);assert.match(result.content[0].text,/disabled/);
+  assert.equal(result.isError,true);
+  // 报错文案是中文的（`… 默认禁用。` + `设 DOUYIN_ALLOW_WRITES=1`）；
+  // 这里断言「拒绝」的语义本身，而不是某个英文单词 —— 之前写的是 /disabled/，
+  // 文案中文化后就一直红着，和实现没关系。
+  assert.match(result.content[0].text,/禁用|disabled/);
+  assert.match(result.content[0].text,/DOUYIN_ALLOW_WRITES/);
 });

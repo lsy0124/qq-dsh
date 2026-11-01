@@ -144,7 +144,7 @@
       "stickerNote": true,
       "collectSticker": true,
       "getSelfImage": true,
-      "sendVoice": true
+      "sendVoice": false
     },
     "wake": {
       "defaultMode": "diving",
@@ -223,7 +223,7 @@
       }
     },
     "voice": {
-      "enabled": true,
+      "enabled": false,
       "dir": "audio",
       "maxSeconds": 300,
       "maxBytes": 20971520,

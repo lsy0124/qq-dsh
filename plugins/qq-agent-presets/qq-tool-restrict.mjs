@@ -179,6 +179,25 @@ const SAFE_PREFIXES = [
   // douyin_search / douyin_status）。这五个都只读，不点赞、不评论、不发私信，
   // 唯一副作用是启动一个受控的 Edge 实例。
   'mcp__douyin__',
+  // 星露谷物语（stardew_*，27 个工具）。
+  // 通过 SMAPI 桥接模组操控游戏：种田、浇水、钓鱼、下矿、战斗、聊天。
+  // 这些工具不碰 QQ、不读敏感文件，只跟本机游戏进程打交道。
+  'mcp__stardew-ai__',
+  // 植物大战僵尸（pvz_*，10 个工具）。
+  // 走游戏内 mod 的 HTTP 桥接（127.0.0.1:8770），不模拟输入、不占键鼠。
+  'mcp__pvz__',
+  // B 站只读浏览（bili_hot / bili_search / bili_detail / bili_comments）。
+  // 全部只读，不投币不点赞不发评论，只访问 B 站公开接口。
+  //
+  // 为什么单独加而不是复用 bili-duty：
+  //   bili-duty 是个独立 DSH 插件，跑在 headless profile 里，跟 QQ 桥接不在一个进程；
+  //   而且它的 headless profile 一直起不来（缺 workbuddy adapter，2026-10-23 起全失败）。
+  //   所以直接给桥接挂一个轻量 MCP，前缀必须和 mcp-bili.js 的 serverName（bili）一致。
+  'mcp__bili__',
+  // 贴吧只读浏览（tieba_threads / tieba_posts）。走 aiotieba，只看不发。
+  // ⚠ tieba_posts 在本机连不上 tiebac.baidu.com（实测连续超时），
+  //   但 tieba_threads 自带正文，刷吧够用。
+  'mcp__tieba__',
 ]
 
 // 无害模型侧工具：ask_user_question 用于把问题转给管理员/用户，
