@@ -14,6 +14,10 @@ const tests = [
   // 且只留下一行日志 —— 必须有登记期断言钉住（活 DSH 侧的实测见
   // scripts/test-dsh-session-retire.mjs）。
   'test-dsh-inbox-projection.mjs',
+  // 记忆写入的字段契约：qq_memory_append 的 extra 必须带过后端真正读的键。
+  // zod 会静默丢掉未声明字段 —— 丢了 changedBy/until，性格就不会变；
+  // 丢了 platform，contentMemory 后端直接 return，刷到的东西一条都不记。
+  'test-memory-contract.mjs',
   'test-md-to-plain.mjs', 'test-slang-learn.mjs', 'test-mux-reconnect.mjs',
   'test-token-economy.mjs', 'test-qq-model-view.mjs', 'test-qq-preset-contract.mjs',
   'test-reply-wait.mjs', 'test-preset-prompt.mjs', 'test-role-card.mjs',

@@ -1233,7 +1233,27 @@ server.tool(
       participants: z.array(z.string()).optional().describe('activeTopic 的参与者列表'),
       pendingQuestion: z.string().optional().describe('activeTopic 里还没问出口的问题'),
       motivation: z.string().optional().describe('pendingThought 的动机，如 curiosity/sociability'),
-      expiresAtMs: z.number().optional().describe('pendingThought 过期毫秒数，默认 2 小时')
+      expiresAtMs: z.number().optional().describe('pendingThought 过期毫秒数，默认 2 小时'),
+      // ── selfBelief：性格变化的载体 ──
+      // 后端 appendMemoryV2 读的就是这三个键（bridge.js 里 selfBelief 分支）。
+      // 少写一个，这条自我认知就退化成一句没有来由的话：
+      // 不知道因为什么改的，也没法把旧想法标成「已经过去了」。
+      changedBy: z.string().optional()
+        .describe('selfBelief：是什么让你这么想的（会渲染成「（因为…）」）'),
+      until: z.string().optional()
+        .describe('selfBelief：要标成「已经过去了」的旧想法（填旧想法的一小段原文）'),
+      weight: z.number().int().min(1).max(5).optional()
+        .describe('selfBelief：1-5，注入力度；同一条再写一次会 +1（上限 5）'),
+      // ── contentMemory：刷到的好东西 ──
+      // platform 是硬前置：后端拿不到它就直接 return，一条都不记。
+      platform: z.string().optional()
+        .describe('contentMemory：来源平台 douyin / bilibili / tieba（必填，否则不记）'),
+      id: z.string().optional()
+        .describe('contentMemory：视频/帖子 ID（同平台同 ID 再刷到只累加强度）'),
+      title: z.string().optional().describe('contentMemory：标题'),
+      url: z.string().optional().describe('contentMemory：链接'),
+      type: z.string().optional()
+        .describe('contentMemory：funny / useful / touching / meme'),
     }).optional().describe('附加信息')
   },
   async ({ key, token, category, content, extra }) => {
